@@ -1,3 +1,17 @@
+# GitHub Description 文案（v2.4.0）
+
+## 一、GitHub 仓库 About 短描述（放仓库简介栏）
+
+**英文（推荐，通用）**
+> BepInEx plugin for Sephiria (Steam 2436940). Press F8 to auto-arrange your inventory: offline scoring model + simulated annealing, supports tablets, position charms, planet clusters, harmony crystals, dedication badges, compass pairing, hourglass-magicbook synergy and more. Works for host and multiplayer clients.
+
+**中文**
+> 《赛菲莉娅》(Steam 2436940) 的 BepInEx 插件。按 F8 一键智能整理背包：全离线评分 + 模拟退火搜索，支持石板、位置护符、行星聚簇、和谐之晶、奉献徽章、指北针配对、沙漏-魔法书联动等，主机与联机客户端均可用。
+
+## 二、完整 README.md（中文版）
+
+---
+
 # Sephiria Backpack Organizer / 赛菲莉娅 背包整理插件
 
 《赛菲莉娅》(Sephiria, Steam AppID 2436940) 的 BepInEx 插件。按 **F8** 一键整理背包，把石板覆盖、护符位置条件、行星聚簇、和谐之晶、奉献徽章、指北针配对、发光的沙漏等所有加成机制尽可能同时吃到。
@@ -35,22 +49,6 @@
 2. 把 `SephiriaBackpackOrganizer.dll` 放进 `BepInEx/plugins/`
 3. 启动游戏，日志出现 `Sephiria Backpack Organizer v2.4.0 已加载` 即成功
 
-> 已编译的 DLL 见 Releases 页；也可以按下面的方式从源码自行构建。
-
-## 从源码编译
-
-1. 安装 .NET SDK（net472 目标）
-2. 打开 `plugin/SephiriaBackpackOrganizer.csproj`，把其中的引用路径改成你自己的环境：
-   - `BepInEx.Core / BepInEx.Unity.Mono / 0Harmony`：你的 BepInEx 安装目录下 `BepInEx/core/`
-   - `Assembly-CSharp / Mirror` 及 Unity 程序集：你的游戏安装目录下 `Sephiria_Data/Managed/`
-3. 构建：
-
-```bash
-dotnet build plugin/SephiriaBackpackOrganizer.csproj -c Release
-```
-
-产物在 `plugin/bin/Release/SephiriaBackpackOrganizer.dll`。
-
 ## 使用
 
 - 游戏中按 **F8** 整理背包
@@ -82,12 +80,42 @@ dotnet build plugin/SephiriaBackpackOrganizer.csproj -c Release
 3. **搜索**：智能初始布局 + 多轮多起点模拟退火（定向移动 + 随机探索），取全局最高分布局
 4. **应用**：主机直接整包写回；联机客户端翻译成交换 / 旋转序列逐步执行
 
-详细机制说明见 `docs/` 下的介绍文档（Word / PPT 与生成脚本）。
-
 ## 更新日志
 
 见 [CHANGELOG.md](CHANGELOG.md)（v2.0 全离线评分模型 → v2.3 优先级/行星聚簇/行锁定/多轮搜索/和谐之晶 → v2.3.9 奉献徽章 → v2.4.0 发光的沙漏配对）。
 
-## 许可证
+## 免责声明
 
-[MIT](LICENSE)。本插件不修改任何游戏文件，仅供学习与个人使用；使用本插件产生的任何后果由使用者自行承担。
+本插件不修改任何游戏文件，仅供学习与个人使用；使用本插件产生的任何后果由使用者自行承担。
+
+---
+
+## 三、README.md（英文精简版，可选）
+
+# Sephiria Backpack Organizer
+
+A BepInEx plugin for *Sephiria* (Steam AppID 2436940, Unity + Mirror). Press **F8** to auto-arrange your inventory so every synergy mechanic triggers at once.
+
+**v2.4.0 · BepInEx 6 (Unity Mono) · host & multiplayer client**
+
+## Features
+
+- One-key arrangement (F8), finishes with an in-game toast
+- Fully offline scoring model: evaluates any layout against the game's real formulas (tablet grids, position conditions, enchant, mystic ×2 …)
+- Simulated annealing with multiple starts & rounds (default 4 rounds, different seeds) — one press reaches the best result; ~200–300 ms on a full 34-slot bag
+- Smart initial layout: tablets → restricted charms → row-locked items → planet module → harmony crystals → dedication badge → hourglass → planet clustering → compass pairing → the rest → burdens to worst cells
+- Supported synergies: planet telescope clusters, harmony crystal level-sum, dedication badge row buff, compass pairing, **glowing hourglass placed left of the longest-CD magic book**, burden dumping, mystic ×2, row-locked items (Kelsardanni Key), weapon-matched charms, priority system
+- Multiplayer client support: computes the optimal layout locally, then applies it via the game's own network ops (Swap / DoClickAction) — no server authority needed, never clears the bag
+- Safety: 3s session-stable delay, snapshot verification before sorting, apply-once
+
+## Install
+
+1. Install BepInEx 6 (Unity Mono build)
+2. Drop `SephiriaBackpackOrganizer.dll` into `BepInEx/plugins/`
+3. Launch the game; the log shows `Sephiria Backpack Organizer v2.4.0`
+
+## Usage
+
+Press **F8** in game. All settings live in `BepInEx/config/com.sephiria.backpack-organizer.cfg` (restart to apply).
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history.

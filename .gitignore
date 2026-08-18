@@ -1,0 +1,15 @@
+# 编译产物
+bin/
+obj/
+*.dll
+*.pdb
+
+# 分发包（dist 目录用于本地打包发布，不入库）
+dist/
+
+# IDE / 系统
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
