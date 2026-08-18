@@ -6,6 +6,12 @@
 - 运行环境：BepInEx 6（Unity Mono）/ Unity 6000.3.21f1 / Mirror 联机
 - 单机、主机、联机客户端均可用
 
+## 演示
+
+<video src="demo/demo.mp4" controls width="100%"></video>
+
+按 **F8** 一键整理背包的实际效果（安装方法见下文）。
+
 ## 功能
 
 - **一键整理**：按 F8 重排背包，完成后提示"整理完毕"
