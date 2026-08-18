@@ -8,7 +8,7 @@
 
 ## 演示
 
-<video src="demo/demo.mp4" controls width="100%"></video>
+<video src="https://github.com/Infinite-Heaven/SephiriaBackpackOrganizer/releases/download/Standard/demo.mp4" controls width="100%"></video>
 
 按 **F8** 一键整理背包的实际效果（安装方法见下文）。
 
