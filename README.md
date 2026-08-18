@@ -6,11 +6,14 @@
 - 运行环境：BepInEx 6（Unity Mono）/ Unity 6000.3.21f1 / Mirror 联机
 - 单机、主机、联机客户端均可用
 
-## 演示
+## 截图
 
-<video src="https://github.com/Infinite-Heaven/SephiriaBackpackOrganizer/releases/download/Standard/demo.mp4" controls width="100%"></video>
+<p align="center">
+  <img src="screenshots/before.png" width="49%" alt="整理前"/>
+  <img src="screenshots/after.png" width="49%" alt="整理后"/>
+</p>
 
-按 **F8** 一键整理背包的实际效果（安装方法见下文）。
+按 **F8** 一键整理背包：左侧整理前、右侧整理后（安装方法见下文）。
 
 ## 功能
 
