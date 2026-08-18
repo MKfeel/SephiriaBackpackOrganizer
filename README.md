@@ -31,30 +31,27 @@
 
 ## 安装
 
-1. 安装 [BepInEx 6](https://github.com/BepInEx/BepInEx)（Unity Mono 版本）
-2. 把 `SephiriaBackpackOrganizer.dll` 放进 `BepInEx/plugins/`
-3. 启动游戏，日志出现 `Sephiria Backpack Organizer v2.4.0 已加载` 即成功
+### 方式一：完整包（推荐，最简单）
 
-> 已编译的 DLL 见 Releases 页；也可以按下面的方式从源码自行构建。
+1. 打开本页右上角 **Releases**，下载最新版完整包（文件名类似 `SephiriaBackpackOrganizer-v2.4.0.zip`）
+2. 解压压缩包，会得到 `BepInEx` 文件夹、`winhttp.dll` 等文件
+3. 全部复制到游戏安装目录：Steam 库中右键《赛菲莉娅》→ 管理 → 浏览本地文件，把解压出的所有文件覆盖粘贴进去
+4. 从 Steam 正常启动游戏，进入游戏后按 **F8** 即可整理背包
 
-## 从源码编译
+> 完整包已经内置 BepInEx 6 框架和插件本体，**不需要再安装任何东西**；重复安装也不会冲突，直接覆盖即可。
 
-1. 安装 .NET SDK（net472 目标）
-2. 打开 `plugin/SephiriaBackpackOrganizer.csproj`，把其中的引用路径改成你自己的环境：
-   - `BepInEx.Core / BepInEx.Unity.Mono / 0Harmony`：你的 BepInEx 安装目录下 `BepInEx/core/`
-   - `Assembly-CSharp / Mirror` 及 Unity 程序集：你的游戏安装目录下 `Sephiria_Data/Managed/`
-3. 构建：
+### 方式二：仅插件包（升级用）
 
-```bash
-dotnet build plugin/SephiriaBackpackOrganizer.csproj -c Release
-```
+之前装过本插件的玩家，下载 **仅插件** 包，把里面的 `SephiriaBackpackOrganizer.dll` 覆盖到 `游戏目录/BepInEx/plugins/` 即可。
 
-产物在 `plugin/bin/Release/SephiriaBackpackOrganizer.dll`。
+### 卸载
+
+删除 `游戏目录/BepInEx/plugins/SephiriaBackpackOrganizer.dll` 即可；若想连同框架一起彻底移除，再删除整个 `BepInEx` 文件夹以及 `winhttp.dll`、`doorstop_config.ini`（只装过本插件时可以这样做）。
 
 ## 使用
 
-- 游戏中按 **F8** 整理背包
-- 全部参数在 `BepInEx/config/com.sephiria.backpack-organizer.cfg`，改完重启游戏生效
+- 游戏中按 **F8** 整理背包，完成后提示"整理完毕"
+- 全部参数在 `游戏目录/BepInEx/config/com.sephiria.backpack-organizer.cfg`，改完重启游戏生效
 
 ## 配置速查
 
@@ -74,6 +71,20 @@ dotnet build plugin/SephiriaBackpackOrganizer.csproj -c Release
 | Synergy | CompassBonus | 12000 | 指北针配对奖励 |
 | Burden | NegativeCellPenalty | 20000 | 负担未待负格扣分 |
 | Mystic | Enable | true | 神秘 ×2 地块 |
+
+## 从源码编译（开发者）
+
+1. 安装 .NET SDK（net472 目标）
+2. 打开 `plugin/SephiriaBackpackOrganizer.csproj`，把其中的引用路径改成你自己的环境：
+   - `BepInEx.Core / BepInEx.Unity.Mono / 0Harmony`：你的 BepInEx 安装目录下 `BepInEx/core/`
+   - `Assembly-CSharp / Mirror` 及 Unity 程序集：你的游戏安装目录下 `Sephiria_Data/Managed/`
+3. 构建：
+
+```bash
+dotnet build plugin/SephiriaBackpackOrganizer.csproj -c Release
+```
+
+产物在 `plugin/bin/Release/SephiriaBackpackOrganizer.dll`。
 
 ## 工作原理（简述）
 
