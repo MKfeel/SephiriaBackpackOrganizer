@@ -143,3 +143,30 @@ score = enabledLevelSum*10000 + enabledCount*1000 + Σdisplayed*10 + overflowSum
 - 实测（2石板+宝珠+负担）：`宝珠1` 识别成功，负担负格✓、25-27ms；
   极端局（30件全宝珠）：宝珠30、神秘30个/×2地块4格，游戏评分 17000→30000、30-33ms。
 
+## v2.4.1 追加：指北针原目标实例绑定
+
+- 捕获整理前每枚已配对指北针正上方物品的 `instanceID`，搜索评分只承认同一目标实例，不再按稀有度或
+  优先级改配到其他伤害神器。
+- 连续纵向叠放的指北针合并为“目标神器 → 指北针 → 指北针”竖链；搜索移动链首后统一恢复整条链，
+  并以硬约束校验最终布局，确保每枚针仍在原目标正下方。
+- 整理前未配对的指北针不建立绑定，继续沿用自动寻找伤害类神器/指北针的旧逻辑。
+
+## v2.4.2 追加：白纸连击补位
+
+- **白纸** = `Charm_WhitePaper`，`Order=Post`；每次连击刷新前检查左右各一格，统计两侧神器
+  `GetItemCategory()` 的交集。某分类在左右共出现 `match=2` 次时，白纸把该分类加入自己的
+  `assignedCategory`，因此会为该连击额外贡献 1 件。
+- 连击“上限”按 `ItemCategoryEntity.comboEffectPrefab` 中 `ComboEffectBase.RequestComboData()` 返回的最高
+  `comboCount`（兼容 `addStatByCombo` / 旧版 `setStatus`）计算。例如坚固最高档为 10，基础数量 9 时白纸
+  放到两件坚固神器中间即可补成 10。
+- 排序时先从 `currentSetEffectCount` 扣除白纸当前已复制的分类，得到不依赖白纸的基础数量；候选按
+  “基础数量降序、距离上限升序”排列。评分与定向移动共同引导白纸夹入最高优先级连击，并惩罚连击已满后
+  继续堆白纸的浪费布局。
+
+## v2.4.3 追加：凯尔萨德尼钥匙自适应周期行
+
+- 游戏类为 `Charm_3Elemental_ByRow`，在 `SearchCategory` 中按 `Item.YIdx % lineCategory.Length`
+  选择分类；实际四行顺序为 `STURDY / EMBER / GLACIER / MAGITECH`，即坚固 / 余烬 / 冰川 / 魔法科技。
+- 选择前从 `currentSetEffectCount` 扣掉白纸当前复制数与钥匙自身的原分类，再以其他神器
+  `GetItemCategory()` 的实际数量兜底，因此依据的是“不靠钥匙自己”的已有最多羁绊。
+- 搜索约束从“保持原行”改为“保持目标行余数”：例如坚固可以在第 1/5/9 行中选择等级与其他协同最优的格子。
