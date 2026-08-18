@@ -40,10 +40,6 @@
 
 > 完整包已经内置 BepInEx 6 框架和插件本体，**不需要再安装任何东西**；重复安装也不会冲突，直接覆盖即可。
 
-### 方式二：仅插件包（升级用）
-
-之前装过本插件的玩家，下载 **仅插件** 包，把里面的 `SephiriaBackpackOrganizer.dll` 覆盖到 `游戏目录/BepInEx/plugins/` 即可。
-
 ### 卸载
 
 删除 `游戏目录/BepInEx/plugins/SephiriaBackpackOrganizer.dll` 即可；若想连同框架一起彻底移除，再删除整个 `BepInEx` 文件夹以及 `winhttp.dll`、`doorstop_config.ini`（只装过本插件时可以这样做）。
@@ -72,32 +68,12 @@
 | Burden | NegativeCellPenalty | 20000 | 负担未待负格扣分 |
 | Mystic | Enable | true | 神秘 ×2 地块 |
 
-## 从源码编译（开发者）
-
-1. 安装 .NET SDK（net472 目标）
-2. 打开 `plugin/SephiriaBackpackOrganizer.csproj`，把其中的引用路径改成你自己的环境：
-   - `BepInEx.Core / BepInEx.Unity.Mono / 0Harmony`：你的 BepInEx 安装目录下 `BepInEx/core/`
-   - `Assembly-CSharp / Mirror` 及 Unity 程序集：你的游戏安装目录下 `Sephiria_Data/Managed/`
-3. 构建：
-
-```bash
-dotnet build plugin/SephiriaBackpackOrganizer.csproj -c Release
-```
-
-产物在 `plugin/bin/Release/SephiriaBackpackOrganizer.dll`。
-
 ## 工作原理（简述）
 
 1. **识别**：把背包物品分类（石板 / 护符 / 负面藏品 / 杂物），识别各机制物品（类型或配置 key）
 2. **评分**：离线模拟游戏全部加成公式，对任意布局打分（等级 × 优先级权重、启用/禁用、行星聚簇、和谐之晶、奉献徽章、罗盘配对、沙漏-魔法书、负担惩罚、行锁定约束等）
 3. **搜索**：智能初始布局 + 多轮多起点模拟退火（定向移动 + 随机探索），取全局最高分布局
 4. **应用**：主机直接整包写回；联机客户端翻译成交换 / 旋转序列逐步执行
-
-详细机制说明见 `docs/` 下的介绍文档（Word / PPT 与生成脚本）。
-
-## 更新日志
-
-见 [CHANGELOG.md](CHANGELOG.md)（v2.0 全离线评分模型 → v2.3 优先级/行星聚簇/行锁定/多轮搜索/和谐之晶 → v2.3.9 奉献徽章 → v2.4.0 发光的沙漏配对）。
 
 ## 许可证
 
