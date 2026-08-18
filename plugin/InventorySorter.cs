@@ -21,17 +21,30 @@ namespace SephiriaBackpackOrganizer
     ///    后期满背包也不再卡顿（原版十几秒 -> 亚秒）。
     /// 2. 【行星望远镜】Charm_PlanetModule 启用时，周围八格 PLANET 分类藏品获得加成
     ///    —— 评分加入"行星聚簇"奖励，搜索会把行星藏品摆到望远镜周围。
-    /// 3. 【指北针】Charm_UpCharmDamage 置于伤害类藏品(IAttackableCharm)下方，
-    ///    或指北针下方再放指北针可链式叠加 —— 评分加入"罗盘配对"奖励。
-    /// 4. 【附魔】物品自身附魔等级(Enchant)随物品走，计入格位等级。
-    /// 5. 【石板位置条件】旗帜(最左列)/遮阳(最上行)等通过 conditionQuery 边界 token
+    /// 3. 【凯尔萨德尼钥匙】按已有最多的坚固/余烬/冰川/魔法科技羁绊选择周期行，
+    ///    并可在第 1/5/9 行这类同余行中选择其他加成最优的格子。
+    /// 4. 【指北针】整理前已指向的伤害类藏品会按实例锁定，整理时整条竖链一起移动，
+    ///    保证指北针仍在原目标正下方；原先未配对的针仍可自动寻找目标并支持链式叠加。
+    /// 5. 【白纸】统计连击当前数量与最高效果档位，把白纸夹进数量最大且未满的连击中，补位后计入评分。
+    /// 6. 【附魔】物品自身附魔等级(Enchant)随物品走，计入格位等级。
+    /// 7. 【石板位置条件】旗帜(最左列)/遮阳(最上行)等通过 conditionQuery 边界 token
     ///    表达，智能摆位按游戏解析器语义评估条件，不满足条件的效果不计入。
-    /// 6. 【心之重担等负面藏品】按 LocalizedString key 识别，直接塞进负数加成格子。
-    /// 7. 【稀有度优先】高稀有度藏品优先获得等级加成，必要时低级藏品被牺牲进负格。
-    /// 8. 安全兜底：最终结果按离线评分与原始布局比较，绝不更差。
+    /// 8. 【心之重担等负面藏品】按 LocalizedString key 识别，直接塞进负数加成格子。
+    /// 9. 【稀有度优先】高稀有度藏品优先获得等级加成，必要时低级藏品被牺牲进负格。
+    /// 10. 安全兜底：最终结果按离线评分与原始布局比较，绝不更差。
     /// </summary>
     public class InventorySorter
     {
+        private static readonly string[] CyclicRowCategories =
+        {
+            "STURDY", "EMBER", "GLACIER", "MAGITECH"
+        };
+
+        private static readonly string[] CyclicRowCategoryNames =
+        {
+            "坚固", "余烬", "冰川", "魔法科技"
+        };
+
         private readonly Plugin plugin;
         private bool busy;
         private float sessionStartTime = -1f;
@@ -177,15 +190,39 @@ namespace SephiriaBackpackOrganizer
             public float magicCd;            // 魔法书 CD 秒数（ActiveSkillEntity.cooldownTime）
             public bool isCompass;          // Charm_UpCharmDamage（指北针）
             public bool isAttackable;       // IAttackableCharm
+            public bool isWhitePaper;       // Charm_WhitePaper（白纸：左右相邻神器共享分类时复制该连击）
+            public HashSet<string> comboCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             public CharmPositionKind kind;
             public EItemRarity rarity;
             public int priority = 4;   // 用户优先级：1最高~4最低（传说/羁绊=1 稀有=2 高级=3 普通=4，特定藏品强制1）
             public bool preferIgnoreCells; // 优先利用豁免格解除位置限制（如冰冷的锁）
-            public bool isRowLocked;   // 行锁定：物品类型随所在行变化（如凯尔萨德尼钥匙），整理不可变行
-            public int lockRow;        // 行锁定物品的固定行（用户摆放时的行）
+            public bool isRowLocked;   // 固定行或周期行约束
+            public int lockRow;        // 固定行号，或 lockRowCycle > 0 时的目标余数
+            public int lockRowCycle;   // >0 时 lockRow 是周期余数：例如 0/4 允许第1、5、9行
+            public bool isCyclicRowCategory; // Charm_3Elemental_ByRow（凯尔萨德尼钥匙）
+            public string originalRowCategory;
+            public string targetRowCategory;
             public int enchant;
             public int maxLevel;
             public ItemEntity entity;
+        }
+
+        /// <summary>
+        /// 整理前已经成立的“目标神器 → 指北针（正下方）”竖向链。
+        /// 链首是被指向的神器，后续成员均为跟随它移动的指北针；支持多枚指北针纵向叠加。
+        /// </summary>
+        private sealed class CompassChain
+        {
+            public int originalRootCell;
+            public readonly List<int> instanceIDs = new List<int>();
+        }
+
+        private sealed class WhitePaperComboTarget
+        {
+            public string category;
+            public string displayName;
+            public int baseCount;
+            public int cap;
         }
 
         private struct EffectEntry
@@ -223,10 +260,20 @@ namespace SephiriaBackpackOrganizer
             public List<ItemInfo> items = new List<ItemInfo>();
             public List<ItemInfo> steles = new List<ItemInfo>();
             public List<ItemInfo> charms = new List<ItemInfo>();
+            public List<ItemInfo> whitePapers = new List<ItemInfo>();
             public List<ItemInfo> burdens = new List<ItemInfo>();
             public List<ItemInfo> others = new List<ItemInfo>();
             public Dictionary<int, Dictionary<int, StelePattern>> stelePatterns; // tabletInstanceID -> cell*4+rot -> pattern
             public Dictionary<int, ItemInfo> itemByInstance = new Dictionary<int, ItemInfo>(); // instanceID -> ItemInfo
+            // 仅记录整理前已经配对的指北针：compass instanceID -> 原先正上方目标 instanceID。
+            public Dictionary<int, int> compassTargetByInstance = new Dictionary<int, int>();
+            public List<CompassChain> compassChains = new List<CompassChain>();
+            public HashSet<int> compassChainInstances = new HashSet<int>();
+            public Dictionary<int, int> compassPositionScratch = new Dictionary<int, int>();
+            public HashSet<int> compassReservedScratch = new HashSet<int>();
+            public int[] compassRootScratch = new int[0];
+            public List<WhitePaperComboTarget> whitePaperTargets = new List<WhitePaperComboTarget>();
+            public int[] whitePaperAssignmentScratch = new int[0];
             public int[] mysticFactor = new int[0]; // 神秘地块等级倍率（默认 1；神秘藏品≥2时1格×2，≥5时4格×2）
             public int mysticCount;                  // 神秘分类藏品数量（游戏组合计数）
             public int mysticActiveCells;            // 实际生效的 ×2 地块数
@@ -325,6 +372,8 @@ namespace SephiriaBackpackOrganizer
                     }
                     info.isCompass = s.charm is Charm_UpCharmDamage;
                     info.isAttackable = s.charm is IAttackableCharm ac && ac.IsAttackableCharm();
+                    info.isWhitePaper = s.charm is Charm_WhitePaper;
+                    info.isCyclicRowCategory = s.charm is Charm_3Elemental_ByRow;
                 }
 
                 try
@@ -387,7 +436,7 @@ namespace SephiriaBackpackOrganizer
                                         break;
                                     }
                                 }
-                                // 行锁定物品（如凯尔萨德尼钥匙：类型随所在行变化，整理不可变行）
+                                // 用户额外指定的固定行物品。凯尔萨德尼钥匙在后续会被自动周期行逻辑覆盖。
                                 foreach (string key in plugin.RowLockedItems.Value.Split(new[] { ',', ';' },
                                              StringSplitOptions.RemoveEmptyEntries))
                                 {
@@ -437,6 +486,35 @@ namespace SephiriaBackpackOrganizer
                     // 忽略数据异常
                 }
 
+                // 记录整理开始时每件非白纸神器实际提供的连击分类。动态分类神器优先读
+                // GetItemCategory；普通神器在失败时回退到 ItemEntity.categories。
+                if (info.isCharm && !info.isWhitePaper)
+                {
+                    try
+                    {
+                        foreach (string category in s.charm.GetItemCategory())
+                        {
+                            if (!string.IsNullOrEmpty(category))
+                            {
+                                info.comboCategories.Add(category);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    if (info.comboCategories.Count == 0 && info.entity != null && info.entity.categories != null)
+                    {
+                        foreach (string category in info.entity.categories)
+                        {
+                            if (!string.IsNullOrEmpty(category))
+                            {
+                                info.comboCategories.Add(category);
+                            }
+                        }
+                    }
+                }
+
                 // 附魔等级（物品自身携带，随物品走）
                 try
                 {
@@ -454,11 +532,16 @@ namespace SephiriaBackpackOrganizer
 
                 ctx.items.Add(info);
                 ctx.itemByInstance[s.instanceID] = info;
+                if (info.isWhitePaper) ctx.whitePapers.Add(info);
                 if (info.isBurden) ctx.burdens.Add(info);
                 else if (info.isStele) ctx.steles.Add(info);
                 else if (info.isCharm) ctx.charms.Add(info);
                 else ctx.others.Add(info);
             }
+
+            ConfigureCyclicRowCategories(ctx);
+            CaptureCompassBindings(ctx, original);
+            BuildWhitePaperTargets(ctx);
 
             // 预计算每块石板的全部摆放模板（以石板实例ID为键）
             ctx.stelePatterns = new Dictionary<int, Dictionary<int, StelePattern>>();
@@ -559,6 +642,442 @@ namespace SephiriaBackpackOrganizer
             }
 
             return ctx;
+        }
+
+        /// <summary>
+        /// 凯尔萨德尼钥匙（Charm_3Elemental_ByRow）按行号每四行循环：
+        /// 坚固 / 余烬 / 冰川 / 魔法科技。整理前先统计除钥匙和白纸外的实际神器分类，
+        /// 选择数量最多的羁绊，之后搜索可在所有对应同余行中自由选最优格。
+        /// </summary>
+        private static void ConfigureCyclicRowCategories(SearchContext ctx)
+        {
+            List<ItemInfo> cyclicItems = ctx.charms.FindAll(item => item.isCyclicRowCategory);
+            if (cyclicItems.Count == 0)
+            {
+                return;
+            }
+
+            int[] counts = new int[CyclicRowCategories.Length];
+            try
+            {
+                foreach (var pair in ctx.inv.currentSetEffectCount)
+                {
+                    for (int i = 0; i < CyclicRowCategories.Length; i++)
+                    {
+                        if (string.Equals(pair.Key, CyclicRowCategories[i], StringComparison.OrdinalIgnoreCase))
+                        {
+                            counts[i] = pair.Value;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            // 游戏当前计数含有白纸和钥匙自身；选目标时先扣掉这些可变因素，
+            // 否则钥匙可能因为自己当前在某行，就永远偏向原分类。
+            foreach (ItemInfo item in ctx.whitePapers)
+            {
+                if (!(item.slot.charm is Charm_WhitePaper paper))
+                {
+                    continue;
+                }
+                try
+                {
+                    foreach (string category in paper.assignedCategory)
+                    {
+                        for (int i = 0; i < CyclicRowCategories.Length; i++)
+                        {
+                            if (string.Equals(category, CyclicRowCategories[i], StringComparison.OrdinalIgnoreCase))
+                            {
+                                counts[i] = Math.Max(0, counts[i] - 1);
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+            foreach (ItemInfo item in cyclicItems)
+            {
+                int originalIndex = (item.index / ctx.width) % CyclicRowCategories.Length;
+                counts[originalIndex] = Math.Max(0, counts[originalIndex] - 1);
+            }
+
+            int[] physicalCounts = new int[CyclicRowCategories.Length];
+            foreach (ItemInfo item in ctx.items)
+            {
+                if (!item.isCharm || item.isWhitePaper || item.isCyclicRowCategory)
+                {
+                    continue;
+                }
+                foreach (string category in item.comboCategories)
+                {
+                    for (int i = 0; i < CyclicRowCategories.Length; i++)
+                    {
+                        if (string.Equals(category, CyclicRowCategories[i], StringComparison.OrdinalIgnoreCase))
+                        {
+                            physicalCounts[i]++;
+                            break;
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < counts.Length; i++)
+            {
+                counts[i] = Math.Max(counts[i], physicalCounts[i]);
+            }
+
+            // 数量并列时优先保留第一把钥匙整理前的羁绊，减少无意义换行。
+            int preferredIndex = (cyclicItems[0].index / ctx.width) % CyclicRowCategories.Length;
+            int bestIndex = -1;
+            int bestCount = int.MinValue;
+            for (int i = 0; i < CyclicRowCategories.Length; i++)
+            {
+                if (i * ctx.width >= ctx.storage)
+                {
+                    continue; // 当前背包还没有这个余数对应的行。
+                }
+                if (counts[i] > bestCount ||
+                    (counts[i] == bestCount && i == preferredIndex && bestIndex != preferredIndex))
+                {
+                    bestIndex = i;
+                    bestCount = counts[i];
+                }
+            }
+            if (bestIndex < 0)
+            {
+                bestIndex = preferredIndex;
+            }
+
+            foreach (ItemInfo item in cyclicItems)
+            {
+                int originalRow = item.index / ctx.width;
+                int originalIndex = originalRow % CyclicRowCategories.Length;
+                item.originalRowCategory = CyclicRowCategories[originalIndex];
+                item.targetRowCategory = CyclicRowCategories[bestIndex];
+                item.isRowLocked = true;
+                item.lockRow = bestIndex;
+                item.lockRowCycle = CyclicRowCategories.Length;
+
+                // 后续白纸评分应使用钥匙整理后将要提供的分类，而不是原行的分类。
+                item.comboCategories.Clear();
+                item.comboCategories.Add(item.targetRowCategory);
+            }
+
+            string rows = string.Join("/", Enumerable.Range(0, ctx.height)
+                .Where(row => row % CyclicRowCategories.Length == bestIndex && row * ctx.width < ctx.storage)
+                .Select(row => (row + 1).ToString()).ToArray());
+            Plugin.Log.LogInfo(
+                $"凯尔萨德尼钥匙：坚固{counts[0]} 余烬{counts[1]} 冰川{counts[2]} 魔法科技{counts[3]}" +
+                $" -> 选择{CyclicRowCategoryNames[bestIndex]}，允许第{rows}行。");
+        }
+
+        private static bool IsAllowedLockedRow(ItemInfo item, int row)
+        {
+            if (item == null || !item.isRowLocked)
+            {
+                return true;
+            }
+            if (item.lockRowCycle > 0)
+            {
+                return row % item.lockRowCycle == item.lockRow;
+            }
+            return row == item.lockRow;
+        }
+
+        /// <summary>
+        /// 记录按下整理键时已经成立的指北针配对。之后优化器只允许这些指北针继续跟随同一个
+        /// 物品实例，不再因为背包里有多个伤害神器而重新选择目标。
+        /// </summary>
+        private static void CaptureCompassBindings(SearchContext ctx, List<Slot> original)
+        {
+            for (int cell = ctx.width; cell < ctx.storage && cell < original.Count; cell++)
+            {
+                Slot compassSlot = original[cell];
+                if (compassSlot == null || !compassSlot.hasItem ||
+                    !ctx.itemByInstance.TryGetValue(compassSlot.instanceID, out ItemInfo compass) ||
+                    compass == null || !compass.isCompass)
+                {
+                    continue;
+                }
+
+                Slot targetSlot = original[cell - ctx.width];
+                if (targetSlot == null || !targetSlot.hasItem || targetSlot.charm == null ||
+                    !ctx.itemByInstance.TryGetValue(targetSlot.instanceID, out ItemInfo target) || target == null)
+                {
+                    continue;
+                }
+
+                // 游戏只允许指向伤害类神器或另一枚指北针；未配对的针仍交给旧逻辑自行配对。
+                if (target.isAttackable || target.isCompass)
+                {
+                    ctx.compassTargetByInstance[compassSlot.instanceID] = targetSlot.instanceID;
+                }
+            }
+
+            if (ctx.compassTargetByInstance.Count == 0)
+            {
+                return;
+            }
+
+            // 原始背包中每件物品正下方最多只有一枚指北针，因此绑定天然组成若干条竖向链。
+            var compassBelowTarget = new Dictionary<int, int>();
+            foreach (var pair in ctx.compassTargetByInstance)
+            {
+                compassBelowTarget[pair.Value] = pair.Key;
+            }
+
+            var visitedCompasses = new HashSet<int>();
+            foreach (var pair in ctx.compassTargetByInstance)
+            {
+                int root = pair.Value;
+                if (ctx.compassTargetByInstance.ContainsKey(root))
+                {
+                    continue; // 目标本身也跟随更上方物品，由更上方的链首统一处理。
+                }
+                AddCompassChain(ctx, root, compassBelowTarget, visitedCompasses);
+            }
+
+            // 防御性兜底：正常竖向布局不会成环；若数据异常，仍把尚未收录的绑定建成链。
+            foreach (var pair in ctx.compassTargetByInstance)
+            {
+                if (!visitedCompasses.Contains(pair.Key))
+                {
+                    AddCompassChain(ctx, pair.Value, compassBelowTarget, visitedCompasses);
+                }
+            }
+            ctx.compassRootScratch = new int[ctx.compassChains.Count];
+        }
+
+        private static void AddCompassChain(SearchContext ctx, int rootInstanceID,
+            Dictionary<int, int> compassBelowTarget, HashSet<int> visitedCompasses)
+        {
+            if (!ctx.itemByInstance.TryGetValue(rootInstanceID, out ItemInfo rootInfo) || rootInfo == null)
+            {
+                return;
+            }
+
+            var chain = new CompassChain { originalRootCell = rootInfo.index };
+            chain.instanceIDs.Add(rootInstanceID);
+            ctx.compassChainInstances.Add(rootInstanceID);
+
+            int current = rootInstanceID;
+            while (compassBelowTarget.TryGetValue(current, out int compassInstanceID) &&
+                   visitedCompasses.Add(compassInstanceID))
+            {
+                chain.instanceIDs.Add(compassInstanceID);
+                ctx.compassChainInstances.Add(compassInstanceID);
+                current = compassInstanceID;
+            }
+
+            if (chain.instanceIDs.Count > 1)
+            {
+                ctx.compassChains.Add(chain);
+            }
+        }
+
+        /// <summary>
+        /// 建立白纸可补位的连击候选。基础数量优先采用游戏已计算的 currentSetEffectCount，并扣除
+        /// 白纸当前临时复制出来的分类；“上限”取该连击效果数据中的最高触发档位。
+        /// </summary>
+        private static void BuildWhitePaperTargets(SearchContext ctx)
+        {
+            if (ctx.whitePapers.Count == 0)
+            {
+                return;
+            }
+
+            var physicalCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (ItemInfo item in ctx.items)
+            {
+                if (!item.isCharm || item.isWhitePaper)
+                {
+                    continue;
+                }
+                foreach (string category in item.comboCategories)
+                {
+                    physicalCounts[category] = physicalCounts.TryGetValue(category, out int count)
+                        ? count + 1
+                        : 1;
+                }
+            }
+
+            var baseCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var pair in ctx.inv.currentSetEffectCount)
+                {
+                    baseCounts[pair.Key] = pair.Value;
+                }
+            }
+            catch
+            {
+            }
+
+            // currentSetEffectCount 已包含白纸当前复制的分类，先扣掉，得到“不靠白纸”的真实基础数量。
+            foreach (ItemInfo item in ctx.whitePapers)
+            {
+                if (!(item.slot.charm is Charm_WhitePaper paper))
+                {
+                    continue;
+                }
+                try
+                {
+                    foreach (string category in paper.assignedCategory)
+                    {
+                        if (baseCounts.TryGetValue(category, out int count))
+                        {
+                            baseCounts[category] = Math.Max(0, count - 1);
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            // currentSetEffectCount 还是整理前的值；钥匙若将换到另一种羁绊行，
+            // 先扣除它原来的分类，再由下方 physicalCounts 补入新分类。
+            foreach (ItemInfo item in ctx.items)
+            {
+                if (!item.isCyclicRowCategory || string.IsNullOrEmpty(item.originalRowCategory))
+                {
+                    continue;
+                }
+                if (baseCounts.TryGetValue(item.originalRowCategory, out int count))
+                {
+                    baseCounts[item.originalRowCategory] = Math.Max(0, count - 1);
+                }
+            }
+
+            // 客户端同步尚未刷新、或钥匙整理后分类已改变时，实际神器数量是最低保证。
+            foreach (var pair in physicalCounts)
+            {
+                baseCounts[pair.Key] = baseCounts.TryGetValue(pair.Key, out int count)
+                    ? Math.Max(count, pair.Value)
+                    : pair.Value;
+            }
+
+            foreach (var pair in baseCounts)
+            {
+                if (pair.Value < 2 ||
+                    !physicalCounts.TryGetValue(pair.Key, out int physicalCount) || physicalCount < 2)
+                {
+                    continue; // 白纸左右至少需要两件真正带该分类的神器。
+                }
+
+                int cap = GetComboEffectCap(ctx, pair.Key, out string displayName);
+                if (cap <= pair.Value)
+                {
+                    continue; // 已经达到最高触发档位，不再浪费白纸。
+                }
+
+                ctx.whitePaperTargets.Add(new WhitePaperComboTarget
+                {
+                    category = pair.Key,
+                    displayName = displayName,
+                    baseCount = pair.Value,
+                    cap = cap
+                });
+            }
+
+            // 用户期望：优先当前数量最大的未满连击；同数量时优先离上限更近的。
+            ctx.whitePaperTargets.Sort((a, b) =>
+            {
+                int count = b.baseCount.CompareTo(a.baseCount);
+                if (count != 0)
+                {
+                    return count;
+                }
+                int gap = (a.cap - a.baseCount).CompareTo(b.cap - b.baseCount);
+                if (gap != 0)
+                {
+                    return gap;
+                }
+                return string.Compare(a.category, b.category, StringComparison.OrdinalIgnoreCase);
+            });
+            ctx.whitePaperAssignmentScratch = new int[ctx.whitePaperTargets.Count];
+        }
+
+        private static int GetComboEffectCap(SearchContext ctx, string category, out string displayName)
+        {
+            displayName = category;
+            int cap = 0;
+            try
+            {
+                ItemCategoryEntity categoryEntity = ItemDatabase.FindItemCategory(category);
+                if (categoryEntity == null)
+                {
+                    return 0;
+                }
+                if (!string.IsNullOrEmpty(categoryEntity.Name))
+                {
+                    displayName = categoryEntity.Name;
+                }
+                if (categoryEntity.setStatus != null)
+                {
+                    foreach (ItemCategoryEntity.SetTarget target in categoryEntity.setStatus)
+                    {
+                        if (target != null)
+                        {
+                            cap = Math.Max(cap, target.itemCount);
+                        }
+                    }
+                }
+
+                ComboEffectBase effect = null;
+                try
+                {
+                    ctx.inv.lastAppliedComboEffects.TryGetValue(category, out effect);
+                }
+                catch
+                {
+                }
+                if (effect == null && categoryEntity.comboEffectPrefab != null)
+                {
+                    effect = categoryEntity.comboEffectPrefab.GetComponent<ComboEffectBase>();
+                }
+                if (effect != null)
+                {
+                    if (effect.addStatByCombo != null)
+                    {
+                        foreach (ComboEffectBase.ComboStat stat in effect.addStatByCombo)
+                        {
+                            if (stat != null)
+                            {
+                                cap = Math.Max(cap, stat.comboCount);
+                            }
+                        }
+                    }
+                    try
+                    {
+                        List<ComboEffectElement> elements = effect.RequestComboData(ctx.inv.UnitAvatar);
+                        if (elements != null)
+                        {
+                            foreach (ComboEffectElement element in elements)
+                            {
+                                if (element != null)
+                                {
+                                    cap = Math.Max(cap, element.comboCount);
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch
+            {
+                return 0;
+            }
+            return cap;
         }
 
         private static StelePattern BuildStelePattern(SearchContext ctx, StoneTablet tablet, ItemPosition origin, int rotation)
@@ -832,8 +1351,173 @@ namespace SephiriaBackpackOrganizer
             }
         }
 
+        /// <summary>
+        /// 指北针当前是否配对。整理前已配对的针必须仍在同一目标实例正下方；未配对的针沿用
+        /// 游戏规则，可指向任意伤害类神器或另一枚指北针。
+        /// </summary>
+        private static bool IsCompassPaired(SearchContext ctx, List<Slot> slots, int cell, Slot compassSlot)
+        {
+            int x = cell % ctx.width;
+            int y = cell / ctx.width;
+            Slot above = At(slots, x, y - 1, ctx.width, ctx.storage);
+            if (above == null || !above.hasItem || above.charm == null)
+            {
+                return false;
+            }
+
+            if (ctx.compassTargetByInstance.TryGetValue(compassSlot.instanceID, out int targetInstanceID))
+            {
+                return above.instanceID == targetInstanceID;
+            }
+
+            return above.charm is Charm_UpCharmDamage ||
+                   (above.charm is IAttackableCharm ac && ac.IsAttackableCharm());
+        }
+
+        private static int CountBrokenCompassBindings(SearchContext ctx, List<Slot> slots)
+        {
+            if (ctx.compassTargetByInstance.Count == 0)
+            {
+                return 0;
+            }
+
+            int broken = 0;
+            int found = 0;
+            int storage = Math.Min(ctx.storage, slots != null ? slots.Count : 0);
+            for (int cell = 0; cell < storage; cell++)
+            {
+                Slot slot = slots[cell];
+                if (slot == null || !slot.hasItem ||
+                    !ctx.compassTargetByInstance.TryGetValue(slot.instanceID, out int targetInstanceID))
+                {
+                    continue;
+                }
+                found++;
+                int aboveCell = cell - ctx.width;
+                if (aboveCell < 0 || aboveCell >= storage ||
+                    slots[aboveCell] == null || !slots[aboveCell].hasItem ||
+                    slots[aboveCell].instanceID != targetInstanceID)
+                {
+                    broken++;
+                }
+            }
+            return broken + (ctx.compassTargetByInstance.Count - found);
+        }
+
+        private static bool CompassBindingsSatisfied(SearchContext ctx, List<Slot> slots)
+        {
+            return CountBrokenCompassBindings(ctx, slots) == 0;
+        }
+
+        private static bool WhitePaperMatchesTarget(SearchContext ctx, List<Slot> slots,
+            int paperCell, int targetIndex)
+        {
+            if (paperCell < 0 || paperCell >= ctx.storage || targetIndex < 0 ||
+                targetIndex >= ctx.whitePaperTargets.Count)
+            {
+                return false;
+            }
+            int x = paperCell % ctx.width;
+            if (x <= 0 || x >= ctx.width - 1)
+            {
+                return false;
+            }
+            int leftCell = paperCell - 1;
+            int rightCell = paperCell + 1;
+            if (rightCell >= ctx.storage)
+            {
+                return false;
+            }
+            Slot left = slots[leftCell];
+            Slot right = slots[rightCell];
+            if (left == null || right == null || !left.hasItem || !right.hasItem ||
+                left.charm == null || right.charm == null ||
+                !ctx.itemByInstance.TryGetValue(left.instanceID, out ItemInfo leftInfo) || leftInfo == null ||
+                !ctx.itemByInstance.TryGetValue(right.instanceID, out ItemInfo rightInfo) || rightInfo == null ||
+                leftInfo.isWhitePaper || rightInfo.isWhitePaper)
+            {
+                return false;
+            }
+            string category = ctx.whitePaperTargets[targetIndex].category;
+            return leftInfo.comboCategories.Contains(category) && rightInfo.comboCategories.Contains(category);
+        }
+
+        /// <summary>统计候选布局中每种连击被多少张白纸复制，并返回没有形成任何有效连击的白纸数量。</summary>
+        private static int RefreshWhitePaperAssignments(SearchContext ctx, List<Slot> slots)
+        {
+            int[] assignments = ctx.whitePaperAssignmentScratch;
+            Array.Clear(assignments, 0, assignments.Length);
+            int unmatched = 0;
+            for (int cell = 0; cell < ctx.storage && cell < slots.Count; cell++)
+            {
+                Slot slot = slots[cell];
+                if (slot == null || !slot.hasItem ||
+                    !ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo info) ||
+                    info == null || !info.isWhitePaper)
+                {
+                    continue;
+                }
+
+                bool matched = false;
+                for (int i = 0; i < ctx.whitePaperTargets.Count; i++)
+                {
+                    if (WhitePaperMatchesTarget(ctx, slots, cell, i))
+                    {
+                        assignments[i]++;
+                        matched = true;
+                    }
+                }
+                if (!matched)
+                {
+                    unmatched++;
+                }
+            }
+            return unmatched;
+        }
+
+        private double EvaluateWhitePaperSynergy(SearchContext ctx, List<Slot> slots)
+        {
+            if (plugin.WhitePaperComboBonus.Value <= 0f || ctx.whitePaperTargets.Count == 0)
+            {
+                return 0d;
+            }
+
+            int unmatched = RefreshWhitePaperAssignments(ctx, slots);
+            double unit = plugin.WhitePaperComboBonus.Value;
+            double score = 0d;
+            for (int i = 0; i < ctx.whitePaperTargets.Count; i++)
+            {
+                WhitePaperComboTarget target = ctx.whitePaperTargets[i];
+                int assigned = ctx.whitePaperAssignmentScratch[i];
+                int remaining = Math.Max(0, target.cap - target.baseCount);
+                int useful = Math.Min(assigned, remaining);
+                // 以“整理前的基础数量”为每张白纸的主权重，保证多张白纸时也是先把
+                // 数量最大的连击补满，再转向下一个。若按补位后的 newCount 累加，
+                // 9/10 + 8/10 两张白纸会与两张都塞给 8/10 得分相同，可能留下 9/10 未满。
+                double rankTie = ctx.whitePaperTargets.Count > 0
+                    ? 4d * (ctx.whitePaperTargets.Count - i) / ctx.whitePaperTargets.Count
+                    : 0d;
+                for (int n = 0; n < useful; n++)
+                {
+                    int newCount = target.baseCount + n + 1;
+                    // 当前数量是第一优先级；同数量按候选排序破局，补满再给小额奖励。
+                    score += unit * (target.baseCount * 10d + rankTie);
+                    if (newCount == target.cap)
+                    {
+                        score += unit * 5d; // 小于“当前数量差 1”的权重，保持数量最大为第一排序。
+                    }
+                }
+                if (assigned > useful)
+                {
+                    score -= unit * 20d * (assigned - useful); // 已满后继续堆白纸属于浪费。
+                }
+            }
+            score -= unit * 20d * unmatched;
+            return score;
+        }
+
         /// <summary>离线评估布局，返回综合评分（越大越好）。
-        /// 结构：游戏评分公式（等级/启用/禁用/负格/溢出）+ 稀有度微调 + 行星聚簇 + 罗盘配对 + 负担强制负格。
+        /// 结构：游戏评分公式（等级/启用/禁用/负格/溢出）+ 稀有度微调 + 行星聚簇 + 指北针原目标绑定 + 负担强制负格。
         /// 注意：完全按"格子"遍历，物品位置以当前布局为准（勿用 ItemInfo.index，那只是原始位置）。</summary>
         private double EvaluateLayout(SearchContext ctx, List<Slot> slots)
         {
@@ -863,6 +1547,14 @@ namespace SephiriaBackpackOrganizer
 
             double score = 0;
 
+            // 用户在整理前已经选定的指北针目标属于硬约束。给任何断开的绑定施加远高于
+            // 全背包正常评分上限的惩罚，保证搜索不会为了其他局部收益改指向。
+            int brokenCompassBindings = CountBrokenCompassBindings(ctx, slots);
+            if (brokenCompassBindings > 0)
+            {
+                score -= brokenCompassBindings * 1000000000d;
+            }
+
             // 负担惩罚基准：格位最低等级（负担应待在最低/负等级格；无负格时放最低格不罚）
             int minLevel = int.MaxValue;
             bool hasBurden = ctx.burdens.Count > 0 && plugin.BurdenPenalty.Value > 0f;
@@ -877,7 +1569,7 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
-            // 罗盘配对状态：上方(y-1)为伤害类/指北针的罗盘视为已配对（配对时效果才生效）
+            // 罗盘配对状态：已绑定的针只认整理前的目标；其余针按原游戏规则判定。
             bool[] compassPaired = null;
             if (plugin.CompassBonus.Value > 0f)
             {
@@ -893,15 +1585,7 @@ namespace SephiriaBackpackOrganizer
                     {
                         continue;
                     }
-                    int x = cell % ctx.width;
-                    int y = cell / ctx.width;
-                    Slot above = At(slots, x, y - 1, ctx.width, ctx.storage);
-                    if (above != null && above.hasItem && above.charm != null)
-                    {
-                        bool valid = above.charm is Charm_UpCharmDamage ||
-                                     (above.charm is IAttackableCharm ac && ac.IsAttackableCharm());
-                        compassPaired[cell] = valid;
-                    }
+                    compassPaired[cell] = IsCompassPaired(ctx, slots, cell, cs);
                 }
             }
 
@@ -949,10 +1633,10 @@ namespace SephiriaBackpackOrganizer
                                CriteriaSatisfied(ctx, info, slots, ignore[cell], cell) &&
                                weaponOk;
 
-                // 行锁定：物品类型随所在行变化（如凯尔萨德尼钥匙），跨行重罚（保持用户选择的类型行）
-                if (info.isRowLocked && cell / ctx.width != info.lockRow)
+                // 固定行物品必须保持原行；凯尔萨德尼钥匙则必须处于选中羁绊的同余行。
+                if (!IsAllowedLockedRow(info, cell / ctx.width))
                 {
-                    score -= 100000;
+                    score -= 100000000d;
                 }
 
                 // 受限护符位置偏好（引导搜索方向）：
@@ -1203,7 +1887,8 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
-            // 指北针：上方为伤害类藏品或另一块指北针时生效（可链式叠加）。
+            // 指北针：整理前已配对的针只给原目标加成，并随原目标移动；未配对的针仍可自动
+            // 寻找任意伤害类藏品或另一块指北针（可链式叠加）。
             // 注意：游戏 OnRequestCharmDamageBonus 无 IsEffectEnabled 检查——指北针即使在负等级格上也给上方藏品加成，
             // 因此配对判定不要求指北针自身启用。
             if (plugin.CompassBonus.Value > 0f)
@@ -1222,23 +1907,21 @@ namespace SephiriaBackpackOrganizer
                     int x = cell % ctx.width;
                     int y = cell / ctx.width;
                     Slot above = At(slots, x, y - 1, ctx.width, ctx.storage);
-                    if (above != null && above.hasItem && above.charm != null)
+                    if (above != null && above.hasItem && above.charm != null &&
+                        IsCompassPaired(ctx, slots, cell, cs))
                     {
-                        bool valid = above.charm is Charm_UpCharmDamage ||
-                                     (above.charm is IAttackableCharm ac && ac.IsAttackableCharm());
-                        if (valid)
+                        // 按上方目标的优先级加权；对于已绑定的针，这里必定是整理前的同一实例。
+                        double w = 1.0;
+                        if (ctx.itemByInstance.TryGetValue(above.instanceID, out ItemInfo aboveInfo) && aboveInfo != null)
                         {
-                            // 按上方伤害藏品的优先级加权：高优先级伤害神器优先获得指北针加成
-                            double w = 1.0;
-                            if (ctx.itemByInstance.TryGetValue(above.instanceID, out ItemInfo aboveInfo) && aboveInfo != null)
-                            {
-                                w = PriorityWeight(aboveInfo.priority);
-                            }
-                            score += plugin.CompassBonus.Value * w;
+                            w = PriorityWeight(aboveInfo.priority);
                         }
+                        score += plugin.CompassBonus.Value * w;
                     }
                 }
             }
+
+            score += EvaluateWhitePaperSynergy(ctx, slots);
 
             return score;
         }
@@ -1299,6 +1982,8 @@ namespace SephiriaBackpackOrganizer
                             {
                                 if (it.isBurden) kind = 'B';
                                 else if (it.isPlanetModule) kind = 'M';
+                                else if (it.isCyclicRowCategory) kind = 'K';
+                                else if (it.isWhitePaper) kind = 'W';
                                 else if (it.isCompass) kind = 'C';
                                 else if (it.isPlanetCategory) kind = 'P';
                                 else kind = 'c';
@@ -1314,7 +1999,7 @@ namespace SephiriaBackpackOrganizer
             Plugin.Log.LogInfo(sb.ToString());
         }
 
-        /// <summary>输出最终布局中特殊机制的落地情况（望远镜聚星/罗盘配对/负担负格），用于验证。</summary>
+        /// <summary>输出最终布局中特殊机制的落地情况（望远镜聚星/指北针绑定/负担负格），用于验证。</summary>
         private static void LogLayoutAnalysis(SearchContext ctx, List<Slot> slots, string tag)
         {
             int w = ctx.width;
@@ -1415,10 +2100,20 @@ namespace SephiriaBackpackOrganizer
                     }
                 }
 
+                if (it.isCyclicRowCategory)
+                {
+                    int categoryIndex = y % CyclicRowCategories.Length;
+                    string categoryName = CyclicRowCategoryNames[categoryIndex];
+                    string expected = string.Equals(CyclicRowCategories[categoryIndex], it.targetRowCategory,
+                        StringComparison.OrdinalIgnoreCase) ? "目标✓" : $"目标应为{it.targetRowCategory}";
+                    Plugin.Log.LogInfo($"{tag} 凯尔萨德尼钥匙@{x},{y}：第{y + 1}行={categoryName} {expected}");
+                }
+
                 if (it.isCompass)
                 {
                     string above = "空";
                     string abovePrio = "";
+                    string binding = "";
                     Slot a = At(slots, x, y - 1, w, ctx.storage);
                     if (a != null && a.hasItem && a.charm != null)
                     {
@@ -1429,7 +2124,29 @@ namespace SephiriaBackpackOrganizer
                             abovePrio = $" P{ai.priority}";
                         }
                     }
-                    Plugin.Log.LogInfo($"{tag} 罗盘@{x},{y}：上方={above}{abovePrio}");
+                    if (ctx.compassTargetByInstance.TryGetValue(s.instanceID, out int targetInstanceID))
+                    {
+                        binding = a != null && a.hasItem && a.instanceID == targetInstanceID
+                            ? " 原目标✓"
+                            : $" 原目标绑定异常(期望实例{targetInstanceID})";
+                    }
+                    Plugin.Log.LogInfo($"{tag} 罗盘@{x},{y}：上方={above}{abovePrio}{binding}");
+                }
+
+                if (it.isWhitePaper)
+                {
+                    var matches = new System.Text.StringBuilder();
+                    for (int i = 0; i < ctx.whitePaperTargets.Count; i++)
+                    {
+                        if (WhitePaperMatchesTarget(ctx, slots, cell, i))
+                        {
+                            WhitePaperComboTarget target = ctx.whitePaperTargets[i];
+                            matches.Append($" {target.displayName}({target.baseCount}→{Math.Min(target.cap, target.baseCount + 1)}/{target.cap})");
+                        }
+                    }
+                    Plugin.Log.LogInfo(matches.Length > 0
+                        ? $"{tag} 白纸@{x},{y}：复制连击{matches}"
+                        : $"{tag} 白纸@{x},{y}：左右未形成可补位的同连击");
                 }
 
                 if (it.isBurden)
@@ -1479,11 +2196,12 @@ namespace SephiriaBackpackOrganizer
             }
             Plugin.Log.LogInfo(
                 $"识别：存储{ctx.storage}格({ctx.width}x{ctx.height}) 石板{ctx.steles.Count} 护符{ctx.charms.Count}" +
-                $" 望远镜{telescopes} 罗盘{compasses} 伤害类{attackable} 行星类{planets} 负担{burdens}" +
+                $" 望远镜{telescopes} 罗盘{compasses}(锁定原目标{ctx.compassTargetByInstance.Count})" +
+                $" 伤害类{attackable} 行星类{planets} 负担{burdens}" +
                 $" 神秘{ctx.mysticCount}个/×2地块{ctx.mysticActiveCells}格" +
                 $" 附魔{enchanted}件(+{enchantSum}) 武器相关{weaponRelated}(匹配{weaponMatched})" +
                 $" 奉献徽章{dedicationBadges} 同伴{dedicationCompanions}" +
-                $" 沙漏{hourglasses} 魔法书{magicBooks}" +
+                $" 沙漏{hourglasses} 魔法书{magicBooks} 白纸{ctx.whitePapers.Count}" +
                 $" 优先级[P1:{priorityCount[1]} P2:{priorityCount[2]} P3:{priorityCount[3]} P4:{priorityCount[4]}]" +
                 $" 稀有度[普通{rarityCount[0]} 优秀{rarityCount[1]} 稀有{rarityCount[2]} 传说{rarityCount[3]} 永恒{rarityCount[4]}]");
 
@@ -1501,6 +2219,24 @@ namespace SephiriaBackpackOrganizer
             if (tagList.Length > 0)
             {
                 Plugin.Log.LogInfo($"护符标签{tagList}");
+            }
+            if (ctx.whitePapers.Count > 0)
+            {
+                if (ctx.whitePaperTargets.Count == 0)
+                {
+                    Plugin.Log.LogInfo("白纸：未找到同时具备两件神器且尚未达到最高档位的连击。");
+                }
+                else
+                {
+                    var targets = new System.Text.StringBuilder();
+                    int limit = Math.Min(5, ctx.whitePaperTargets.Count);
+                    for (int i = 0; i < limit; i++)
+                    {
+                        WhitePaperComboTarget target = ctx.whitePaperTargets[i];
+                        targets.Append($" [{target.displayName}:{target.baseCount}/{target.cap}]");
+                    }
+                    Plugin.Log.LogInfo($"白纸补位候选（按优先级）:{targets}");
+                }
             }
         }
 
@@ -1556,7 +2292,7 @@ namespace SephiriaBackpackOrganizer
             var slotsNow = SlotsFromArray(result, storage);
             EvaluateLayout(ctx, slotsNow);
 
-            // 2) 护符放置顺序：受限护符(位置条件) → 望远镜 → 行星聚簇 → 罗盘配对 → 其余(稀有度)
+            // 2) 护符放置顺序：受限护符(位置条件) → 望远镜 → 行星聚簇 → 指北针原目标绑定 → 其余(稀有度)
             var remaining = new List<ItemInfo>(ctx.charms);
 
             // 2a) 位置条件受限的护符（必须满足条件才生效；同条件等级内按用户优先级）
@@ -1587,14 +2323,14 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
-            // 2a2) 行锁定物品（如凯尔萨德尼钥匙）：放回用户所在行，行内最佳列（FindBestCharmCell 已限行）
+            // 2a2) 行约束物品：普通配置项保持原行；凯尔萨德尼钥匙可在选中羁绊的周期行中择优。
             var rowLocked = remaining.FindAll(x => x.isRowLocked);
             foreach (ItemInfo rl in rowLocked)
             {
                 int cell = FindBestCharmCell(ctx, rl, result, occupied, slotsNow);
                 if (cell < 0)
                 {
-                    cell = FirstFreeInRow(occupied, rl.lockRow, ctx);
+                    cell = FirstFreeForLockedItem(occupied, rl, ctx);
                 }
                 if (cell >= 0)
                 {
@@ -1755,11 +2491,13 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
-            // 2d) 指北针配对：放在"上方是伤害类/指北针"的格子（优先），否则普通选格
+            // 2d) 指北针：先按通用规则落位；函数末尾会把整理前已配对的针恢复到原目标正下方。
             var compasses = remaining.FindAll(x => x.isCompass);
             foreach (ItemInfo compass in compasses)
             {
-                int target = FindCompassTargetCell(ctx, result, occupied);
+                int target = ctx.compassTargetByInstance.ContainsKey(compass.slot.instanceID)
+                    ? -1
+                    : FindCompassTargetCell(ctx, result, occupied);
                 if (target < 0)
                 {
                     target = FindBestCharmCell(ctx, compass, result, occupied, slotsNow, harmonyNeighbors, dedicationRow);
@@ -1830,10 +2568,30 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
-            return SlotsFromArray(result, storage);
+            List<Slot> smart = SlotsFromArray(result, storage);
+            if (!RestoreCompassBindings(ctx, smart))
+            {
+                Plugin.Log.LogWarning("智能初始布局无法恢复指北针原目标绑定，已回退整理前布局。");
+                return CloneSlots(ctx.original);
+            }
+            if (ctx.whitePaperTargets.Count > 0 && plugin.WhitePaperComboBonus.Value > 0f)
+            {
+                EvaluateLayout(ctx, smart);
+                var whitePaperRng = new System.Random(ctx.storage * 397 ^ ctx.items.Count * 7919);
+                int attempts = Math.Max(4, ctx.whitePapers.Count * 4);
+                for (int i = 0; i < attempts; i++)
+                {
+                    if (TryWhitePaperMove(ctx, smart, whitePaperRng))
+                    {
+                        RestoreCompassBindings(ctx, smart);
+                        EvaluateLayout(ctx, smart);
+                    }
+                }
+            }
+            return smart;
         }
 
-        /// <summary>找"上方是伤害类/指北针"的空格（罗盘配对目标）；上方伤害藏品优先级越高越优先。</summary>
+        /// <summary>为原先未配对的指北针找“上方是伤害类/指北针”的空格；上方伤害藏品优先级越高越优先。</summary>
         private int FindCompassTargetCell(SearchContext ctx, Slot[] result, bool[] occupied)
         {
             int best = -1;
@@ -1966,9 +2724,9 @@ namespace SephiriaBackpackOrganizer
                 }
                 int x = cell % ctx.width;
                 int y = cell / ctx.width;
-                if (charm.isRowLocked && y != charm.lockRow)
+                if (!IsAllowedLockedRow(charm, y))
                 {
-                    continue; // 行锁定：只能在本行内调整
+                    continue;
                 }
                 if (charm.isHourglass && x == ctx.width - 1)
                 {
@@ -2083,14 +2841,12 @@ namespace SephiriaBackpackOrganizer
             return -1;
         }
 
-        /// <summary>指定行内第一个空闲格子（行锁定物品用）。</summary>
-        private static int FirstFreeInRow(bool[] occupied, int row, SearchContext ctx)
+        /// <summary>找到第一个满足物品行约束的空闲格。</summary>
+        private static int FirstFreeForLockedItem(bool[] occupied, ItemInfo item, SearchContext ctx)
         {
-            int start = row * ctx.width;
-            int end = Math.Min(ctx.storage, start + ctx.width);
-            for (int i = start; i < end; i++)
+            for (int i = 0; i < ctx.storage; i++)
             {
-                if (!occupied[i])
+                if (!occupied[i] && IsAllowedLockedRow(item, i / ctx.width))
                 {
                     return i;
                 }
@@ -2106,6 +2862,188 @@ namespace SephiriaBackpackOrganizer
                 list.Add(result[i] != null ? result[i] : Slot.Empty());
             }
             return list;
+        }
+
+        private static void FillItemPositionMap(List<Slot> slots, Dictionary<int, int> positions)
+        {
+            positions.Clear();
+            if (slots == null)
+            {
+                return;
+            }
+            for (int i = 0; i < slots.Count; i++)
+            {
+                Slot slot = slots[i];
+                if (slot != null && slot.hasItem)
+                {
+                    positions[slot.instanceID] = i;
+                }
+            }
+        }
+
+        private static bool CanPlaceCompassChain(SearchContext ctx, CompassChain chain, int rootCell,
+            HashSet<int> reserved)
+        {
+            if (rootCell < 0 || rootCell >= ctx.storage)
+            {
+                return false;
+            }
+
+            int x = rootCell % ctx.width;
+            for (int i = 0; i < chain.instanceIDs.Count; i++)
+            {
+                int cell = rootCell + i * ctx.width;
+                if (cell < 0 || cell >= ctx.storage || cell % ctx.width != x ||
+                    (reserved != null && reserved.Contains(cell)))
+                {
+                    return false;
+                }
+
+                // 与已有的行锁定规则兼容：若链中物品被配置为锁行，整条链只能选满足该行的位置。
+                if (ctx.itemByInstance.TryGetValue(chain.instanceIDs[i], out ItemInfo info) &&
+                    info != null && !IsAllowedLockedRow(info, cell / ctx.width))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static void SetCompassChainReservation(SearchContext ctx, CompassChain chain, int rootCell,
+            HashSet<int> reserved, bool value)
+        {
+            for (int i = 0; i < chain.instanceIDs.Count; i++)
+            {
+                int cell = rootCell + i * ctx.width;
+                if (value)
+                {
+                    reserved.Add(cell);
+                }
+                else
+                {
+                    reserved.Remove(cell);
+                }
+            }
+        }
+
+        private static int FindClosestCompassChainRoot(SearchContext ctx, CompassChain chain,
+            int currentRoot, int fallbackRoot, HashSet<int> reserved)
+        {
+            int reference = currentRoot >= 0 ? currentRoot : fallbackRoot;
+            int referenceX = reference % ctx.width;
+            int referenceY = reference / ctx.width;
+            int best = -1;
+            int bestDistance = int.MaxValue;
+            int bestFallbackPenalty = int.MaxValue;
+
+            for (int cell = 0; cell < ctx.storage; cell++)
+            {
+                if (!CanPlaceCompassChain(ctx, chain, cell, reserved))
+                {
+                    continue;
+                }
+
+                int distance = Math.Abs(cell % ctx.width - referenceX) +
+                               Math.Abs(cell / ctx.width - referenceY);
+                int fallbackPenalty = cell == fallbackRoot ? 0 : 1;
+                if (distance < bestDistance ||
+                    (distance == bestDistance && fallbackPenalty < bestFallbackPenalty) ||
+                    (distance == bestDistance && fallbackPenalty == bestFallbackPenalty && cell < best))
+                {
+                    best = cell;
+                    bestDistance = distance;
+                    bestFallbackPenalty = fallbackPenalty;
+                }
+            }
+            return best;
+        }
+
+        private static void SwapSlotsAndTrack(List<Slot> slots, Dictionary<int, int> positions, int a, int b)
+        {
+            if (a == b)
+            {
+                return;
+            }
+            SwapSlots(slots, a, b);
+            if (slots[a] != null && slots[a].hasItem)
+            {
+                positions[slots[a].instanceID] = a;
+            }
+            if (slots[b] != null && slots[b].hasItem)
+            {
+                positions[slots[b].instanceID] = b;
+            }
+        }
+
+        /// <summary>
+        /// 把整理前已配对的指北针恢复到原目标正下方。以链首目标的候选位置为锚点，后续指北针
+        /// 随它一起移动；若链首落到背包底部等无空间位置，则选择最近的可容纳竖链位置。
+        /// </summary>
+        private static bool RestoreCompassBindings(SearchContext ctx, List<Slot> slots)
+        {
+            if (ctx.compassChains.Count == 0)
+            {
+                return true;
+            }
+            if (CompassBindingsSatisfied(ctx, slots))
+            {
+                return true;
+            }
+
+            var positions = ctx.compassPositionScratch;
+            FillItemPositionMap(slots, positions);
+            var reserved = ctx.compassReservedScratch;
+            reserved.Clear();
+            int[] assignedRoots = ctx.compassRootScratch;
+
+            // 先以整理前位置建立一组必定互不重叠的保底分配。
+            for (int i = 0; i < ctx.compassChains.Count; i++)
+            {
+                CompassChain chain = ctx.compassChains[i];
+                if (!CanPlaceCompassChain(ctx, chain, chain.originalRootCell, reserved))
+                {
+                    return false;
+                }
+                assignedRoots[i] = chain.originalRootCell;
+                SetCompassChainReservation(ctx, chain, assignedRoots[i], reserved, true);
+            }
+
+            // 尽量采用链首在当前候选布局中的新位置，使“目标移动、指北针跟随”真正参与优化。
+            for (int i = 0; i < ctx.compassChains.Count; i++)
+            {
+                CompassChain chain = ctx.compassChains[i];
+                SetCompassChainReservation(ctx, chain, assignedRoots[i], reserved, false);
+
+                int currentRoot = positions.TryGetValue(chain.instanceIDs[0], out int rootCell)
+                    ? rootCell
+                    : chain.originalRootCell;
+                int chosen = FindClosestCompassChainRoot(ctx, chain, currentRoot,
+                    chain.originalRootCell, reserved);
+                if (chosen < 0)
+                {
+                    return false;
+                }
+                assignedRoots[i] = chosen;
+                SetCompassChainReservation(ctx, chain, chosen, reserved, true);
+            }
+
+            // 通过交换完成排列，物品集合不增不减；位置表随每次交换更新。
+            for (int i = 0; i < ctx.compassChains.Count; i++)
+            {
+                CompassChain chain = ctx.compassChains[i];
+                for (int k = 0; k < chain.instanceIDs.Count; k++)
+                {
+                    int instanceID = chain.instanceIDs[k];
+                    if (!positions.TryGetValue(instanceID, out int from))
+                    {
+                        return false;
+                    }
+                    int target = assignedRoots[i] + k * ctx.width;
+                    SwapSlotsAndTrack(slots, positions, from, target);
+                }
+            }
+
+            return CompassBindingsSatisfied(ctx, slots);
         }
 
         /// <summary>防御：校验 CaptureState 快照与背包当前状态一致（物品实例集合相同），
@@ -2338,6 +3276,13 @@ namespace SephiriaBackpackOrganizer
                     bestLayout = result.Best;
                 }
             }
+
+            if (!CompassBindingsSatisfied(ctx, bestLayout))
+            {
+                Plugin.Log.LogWarning("搜索结果破坏了整理前的指北针目标绑定，已回退整理前布局。");
+                bestLayout = CloneSlots(original);
+                globalBest = beforeScore;
+            }
             bestScore = globalBest;
 
             return globalBest >= beforeScore - 0.5 ? bestLayout : original;
@@ -2534,6 +3479,10 @@ namespace SephiriaBackpackOrganizer
             int iterations, int restarts, float temp0)
         {
             var best = CloneSlots(start);
+            if (!RestoreCompassBindings(ctx, best))
+            {
+                best = CloneSlots(ctx.original);
+            }
             double bestScore = EvaluateLayout(ctx, best);
 
             var candidate = CloneSlots(best);
@@ -2545,6 +3494,10 @@ namespace SephiriaBackpackOrganizer
                 {
                     var mutated = CloneSlots(candidate);
                     Mutate(ctx, mutated, rng);
+                    if (!RestoreCompassBindings(ctx, mutated))
+                    {
+                        continue;
+                    }
 
                     double s = EvaluateLayout(ctx, mutated);
 
@@ -2628,7 +3581,7 @@ namespace SephiriaBackpackOrganizer
 
             int roll = rng.Next(100);
 
-            // 定向移动族（合计约 45%）
+            // 定向移动族（合计约 52%）
             if (roll < 12 && plugin.CriteriaMoveChance.Value > 0f)
             {
                 if (TryCriteriaMove(ctx, slots, rng)) return;
@@ -2645,13 +3598,17 @@ namespace SephiriaBackpackOrganizer
             {
                 if (TryBurdenDump(ctx, slots, rng)) return;
             }
-            if (roll < 45 && plugin.HourglassBonus.Value > 0f)
+            if (roll < 45 && ctx.whitePaperTargets.Count > 0 && plugin.WhitePaperComboBonus.Value > 0f)
+            {
+                if (TryWhitePaperMove(ctx, slots, rng)) return;
+            }
+            if (roll < 52 && plugin.HourglassBonus.Value > 0f)
             {
                 if (TryHourglassMove(ctx, slots, rng)) return;
             }
 
             // 随机移动/交换/旋转
-            if (roll < 67 && emptyIdx.Count > 0)
+            if (roll < 72 && emptyIdx.Count > 0)
             {
                 int a = itemIdx[rng.Next(itemIdx.Count)];
                 int b = emptyIdx[rng.Next(emptyIdx.Count)];
@@ -2659,7 +3616,7 @@ namespace SephiriaBackpackOrganizer
                 return;
             }
 
-            if (roll < 87)
+            if (roll < 90)
             {
                 if (itemIdx.Count >= 2)
                 {
@@ -2830,21 +3787,59 @@ namespace SephiriaBackpackOrganizer
             return true;
         }
 
-        /// <summary>罗盘配对：把指北针移到伤害类藏品/指北针的正下方，或把伤害藏品移到指北针上方。</summary>
+        /// <summary>
+        /// 罗盘定向移动：整理前已配对的竖链按整体探索新位置；未配对的指北针仍可自动寻找
+        /// 伤害类藏品/指北针。
+        /// </summary>
         private bool TryCompassMove(SearchContext ctx, List<Slot> slots, System.Random rng)
         {
-            var compasses = new List<int>();
-            foreach (ItemInfo it in ctx.charms)
+            if (ctx.compassChains.Count > 0 && rng.Next(100) < 70)
             {
-                if (it.isCompass && slots[it.index] != null && slots[it.index].hasItem)
+                CompassChain chain = ctx.compassChains[rng.Next(ctx.compassChains.Count)];
+                var positions = ctx.compassPositionScratch;
+                FillItemPositionMap(slots, positions);
+                if (positions.TryGetValue(chain.instanceIDs[0], out int rootCell))
                 {
-                    compasses.Add(it.index);
+                    var chainMembers = new HashSet<int>(chain.instanceIDs);
+                    var roots = new List<int>();
+                    for (int cell = 0; cell < ctx.storage; cell++)
+                    {
+                        if (cell == rootCell || !CanPlaceCompassChain(ctx, chain, cell, null))
+                        {
+                            continue;
+                        }
+                        Slot target = slots[cell];
+                        if (target != null && target.hasItem && chainMembers.Contains(target.instanceID))
+                        {
+                            continue;
+                        }
+                        roots.Add(cell);
+                    }
+                    if (roots.Count > 0)
+                    {
+                        // 这里只移动链首；Anneal 在评分前统一调用 RestoreCompassBindings，后续针会跟上。
+                        SwapSlots(slots, rootCell, roots[rng.Next(roots.Count)]);
+                        return true;
+                    }
+                }
+            }
+
+            var compasses = new List<int>();
+            for (int cell = 0; cell < ctx.storage; cell++)
+            {
+                Slot slot = slots[cell];
+                if (slot != null && slot.hasItem &&
+                    ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo info) && info != null &&
+                    info.isCompass && !ctx.compassChainInstances.Contains(slot.instanceID))
+                {
+                    compasses.Add(cell);
                 }
             }
             if (compasses.Count == 0)
             {
                 return false;
             }
+            var unboundCompassCells = new HashSet<int>(compasses);
 
             // 目标：把某块指北针移到"上方有有效依赖"的格子（空格或可交换格），或把攻击类藏品移到指北针上方
             var compassTargets = new List<int>();
@@ -2869,7 +3864,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 // 反向：把攻击类藏品放到指北针上方（目标格为空或可交换）
                 int below = (y + 1) * ctx.width + x;
-                if (y < ctx.height - 1 && below < ctx.storage && slots[below] != null && slots[below].hasItem && slots[below].charm is Charm_UpCharmDamage)
+                if (y < ctx.height - 1 && below < ctx.storage && unboundCompassCells.Contains(below))
                 {
                     if (!(slots[cell] != null && slots[cell].hasItem))
                     {
@@ -2888,11 +3883,15 @@ namespace SephiriaBackpackOrganizer
             if (damageTargets.Count > 0)
             {
                 var damages = new List<int>();
-                foreach (ItemInfo it in ctx.charms)
+                for (int cell = 0; cell < ctx.storage; cell++)
                 {
-                    if (it.isAttackable && !it.isCompass && slots[it.index] != null && slots[it.index].hasItem)
+                    Slot slot = slots[cell];
+                    if (slot != null && slot.hasItem &&
+                        ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo info) && info != null &&
+                        info.isAttackable && !info.isCompass &&
+                        !ctx.compassChainInstances.Contains(slot.instanceID))
                     {
-                        damages.Add(it.index);
+                        damages.Add(cell);
                     }
                 }
                 if (damages.Count > 0)
@@ -2902,6 +3901,182 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
+            return false;
+        }
+
+        private static bool CanUseWhitePaperTriple(SearchContext ctx, List<Slot> slots, int rootCell,
+            int paperInstanceID, int leftInstanceID, int rightInstanceID)
+        {
+            int row = rootCell / ctx.width;
+            for (int offset = 0; offset < 3; offset++)
+            {
+                int cell = rootCell + offset;
+                if (cell < 0 || cell >= ctx.storage || cell / ctx.width != row)
+                {
+                    return false;
+                }
+                Slot occupant = slots[cell];
+                if (occupant == null || !occupant.hasItem)
+                {
+                    continue;
+                }
+                if (ctx.compassChainInstances.Contains(occupant.instanceID))
+                {
+                    return false; // 不拆用户已经锁定的指北针竖链。
+                }
+                if (ctx.itemByInstance.TryGetValue(occupant.instanceID, out ItemInfo occupantInfo) && occupantInfo != null)
+                {
+                    bool selected = occupant.instanceID == paperInstanceID ||
+                                    occupant.instanceID == leftInstanceID ||
+                                    occupant.instanceID == rightInstanceID;
+                    if (occupantInfo.isWhitePaper && occupant.instanceID != paperInstanceID)
+                    {
+                        return false;
+                    }
+                    if (occupantInfo.isRowLocked && !selected)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (ctx.itemByInstance.TryGetValue(leftInstanceID, out ItemInfo leftInfo) && leftInfo != null &&
+                !IsAllowedLockedRow(leftInfo, row))
+            {
+                return false;
+            }
+            if (ctx.itemByInstance.TryGetValue(rightInstanceID, out ItemInfo rightInfo) && rightInfo != null &&
+                !IsAllowedLockedRow(rightInfo, row))
+            {
+                return false;
+            }
+            if (ctx.itemByInstance.TryGetValue(paperInstanceID, out ItemInfo paperInfo) && paperInfo != null &&
+                !IsAllowedLockedRow(paperInfo, row))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>把一张白纸定向摆到“当前数量最大且未满”的连击两件神器之间。</summary>
+        private bool TryWhitePaperMove(SearchContext ctx, List<Slot> slots, System.Random rng)
+        {
+            if (ctx.whitePaperTargets.Count == 0 || plugin.WhitePaperComboBonus.Value <= 0f)
+            {
+                return false;
+            }
+
+            RefreshWhitePaperAssignments(ctx, slots);
+            var paperCells = new List<int>();
+            for (int cell = 0; cell < ctx.storage; cell++)
+            {
+                Slot slot = slots[cell];
+                if (slot != null && slot.hasItem &&
+                    ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo info) &&
+                    info != null && info.isWhitePaper)
+                {
+                    paperCells.Add(cell);
+                }
+            }
+            if (paperCells.Count == 0)
+            {
+                return false;
+            }
+
+            int paperStart = rng.Next(paperCells.Count);
+            for (int paperOffset = 0; paperOffset < paperCells.Count; paperOffset++)
+            {
+                int paperCell = paperCells[(paperStart + paperOffset) % paperCells.Count];
+                int paperInstanceID = slots[paperCell].instanceID;
+
+                for (int targetIndex = 0; targetIndex < ctx.whitePaperTargets.Count; targetIndex++)
+                {
+                    WhitePaperComboTarget target = ctx.whitePaperTargets[targetIndex];
+                    bool currentlyMatches = WhitePaperMatchesTarget(ctx, slots, paperCell, targetIndex);
+                    int otherAssignments = ctx.whitePaperAssignmentScratch[targetIndex] - (currentlyMatches ? 1 : 0);
+                    if (target.baseCount + otherAssignments >= target.cap)
+                    {
+                        continue;
+                    }
+
+                    var artifacts = new List<int>();
+                    for (int cell = 0; cell < ctx.storage; cell++)
+                    {
+                        Slot slot = slots[cell];
+                        if (slot == null || !slot.hasItem || slot.instanceID == paperInstanceID ||
+                            ctx.compassChainInstances.Contains(slot.instanceID) ||
+                            !ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo info) || info == null ||
+                            info.isWhitePaper || !info.comboCategories.Contains(target.category))
+                        {
+                            continue;
+                        }
+                        artifacts.Add(cell);
+                    }
+                    if (artifacts.Count < 2)
+                    {
+                        continue;
+                    }
+
+                    // 这张已经处在当前最优的可补位连击中；保留它，但继续检查
+                    // 其他白纸，让多出来的白纸能转向下一个未满连击。
+                    if (currentlyMatches)
+                    {
+                        break;
+                    }
+
+                    int bestRoot = -1;
+                    int bestLeftID = -1;
+                    int bestRightID = -1;
+                    float bestScore = float.MinValue;
+                    int pairAttempts = Math.Min(16, Math.Max(1, artifacts.Count * 2));
+                    for (int attempt = 0; attempt < pairAttempts; attempt++)
+                    {
+                        int leftPick = rng.Next(artifacts.Count);
+                        int rightPick = rng.Next(artifacts.Count - 1);
+                        if (rightPick >= leftPick) rightPick++;
+                        int leftCell = artifacts[leftPick];
+                        int rightCell = artifacts[rightPick];
+                        int leftID = slots[leftCell].instanceID;
+                        int rightID = slots[rightCell].instanceID;
+                        if (rng.Next(2) == 0)
+                        {
+                            int tmp = leftID;
+                            leftID = rightID;
+                            rightID = tmp;
+                        }
+
+                        for (int root = 0; root < ctx.storage; root++)
+                        {
+                            if (root % ctx.width > ctx.width - 3 || root + 2 >= ctx.storage ||
+                                !CanUseWhitePaperTriple(ctx, slots, root, paperInstanceID, leftID, rightID))
+                            {
+                                continue;
+                            }
+                            float score = ctx.cellLevel[root] + ctx.cellLevel[root + 2] + ctx.cellLevel[root + 1] * 0.25f;
+                            if (slots[root].hasItem && slots[root].instanceID == leftID) score += 10f;
+                            if (slots[root + 1].hasItem && slots[root + 1].instanceID == paperInstanceID) score += 10f;
+                            if (slots[root + 2].hasItem && slots[root + 2].instanceID == rightID) score += 10f;
+                            if (score > bestScore)
+                            {
+                                bestScore = score;
+                                bestRoot = root;
+                                bestLeftID = leftID;
+                                bestRightID = rightID;
+                            }
+                        }
+                    }
+
+                    if (bestRoot >= 0)
+                    {
+                        var positions = ctx.compassPositionScratch;
+                        FillItemPositionMap(slots, positions);
+                        SwapSlotsAndTrack(slots, positions, positions[bestLeftID], bestRoot);
+                        SwapSlotsAndTrack(slots, positions, positions[paperInstanceID], bestRoot + 1);
+                        SwapSlotsAndTrack(slots, positions, positions[bestRightID], bestRoot + 2);
+                        return true;
+                    }
+                }
+            }
             return false;
         }
 
@@ -3142,6 +4317,7 @@ namespace SephiriaBackpackOrganizer
             var rng = new System.Random(Environment.TickCount);
             var scrambled = CloneSlots(original);
             Scramble(scrambled, rng);
+            RestoreCompassBindings(ctx, scrambled);
             double scrambledScore = EvaluateLayout(ctx, scrambled);
             Plugin.Log.LogInfo($"自检：已随机打乱（离线 {before:F0} -> {scrambledScore:F0}）。");
 

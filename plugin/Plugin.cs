@@ -64,6 +64,7 @@ namespace SephiriaBackpackOrganizer
         internal ConfigEntry<float> DedicationCompanionBonus;
         internal ConfigEntry<string> HourglassItems;
         internal ConfigEntry<float> HourglassBonus;
+        internal ConfigEntry<float> WhitePaperComboBonus;
         internal ConfigEntry<float> CompassBonus;
         internal ConfigEntry<float> CompassUnpairedFactor;
         internal ConfigEntry<float> BurdenPenalty;
@@ -103,9 +104,9 @@ namespace SephiriaBackpackOrganizer
                     "防止背包未就绪时整理导致物品丢失）", new AcceptableValueRange<float>(0f, 30f)));
 
             RowLockedItems = Config.Bind("General", "RowLockedItems",
-                "Item_Lightning_Damage_Name",
-                "行锁定物品 LocalizedString key（逗号分隔）：整理时保持用户所在行、只在行内调整位置。"
-                + "默认凯尔萨德尼钥匙（其藏品类型随所在行变化，不可变行）");
+                "",
+                "额外需固定在整理前原行的物品 LocalizedString key（逗号分隔）。"
+                + "凯尔萨德尼钥匙无需填写：插件会自动按当前最多的坚固/余烬/冰川/魔法科技羁绊选择周期行");
 
             VanillaIterations = Config.Bind("Vanilla", "MaxIterations", 30,
                 new ConfigDescription("游戏内置自动排列的最大迭代次数（原版默认 4，越大效果越好但耗时略增）",
@@ -224,9 +225,14 @@ namespace SephiriaBackpackOrganizer
                     "CD 越长奖励越高 → 搜索会把沙漏放到 CD 最长的魔法书左边",
                     new AcceptableValueRange<float>(0f, 50000f)));
 
+            WhitePaperComboBonus = Config.Bind("Synergy", "WhitePaperComboBonus", 5000f,
+                new ConfigDescription("白纸夹在两件同连击神器中间时的补位评分权重（0=关闭）。" +
+                    "优先当前数量最大但尚未达到最高效果档位的连击；例如坚固 9/10 时优先用白纸补到 10",
+                    new AcceptableValueRange<float>(0f, 100000f)));
+
             CompassBonus = Config.Bind("Synergy", "CompassBonus", 12000f,
-                new ConfigDescription("指北针(Charm_UpCharmDamage)上方有伤害类藏品/指北针时的加成奖励（0=关闭）。" +
-                    "行星藏品属伤害类，指北针放在行星下方可增强行星，奖励值代表该增强的权重",
+                new ConfigDescription("指北针(Charm_UpCharmDamage)维持整理前原目标时的评分奖励（0=不额外加分，原目标绑定仍始终生效）。" +
+                    "整理前已配对的针会锁定同一个物品实例并随它移动；只有原先未配对的针才自动寻找伤害类藏品/指北针",
                     new AcceptableValueRange<float>(0f, 50000f)));
 
             CompassUnpairedFactor = Config.Bind("Synergy", "CompassUnpairedFactor", 0.1f,
@@ -386,6 +392,6 @@ namespace SephiriaBackpackOrganizer
     {
         public const string PLUGIN_GUID = "com.sephiria.backpack-organizer";
         public const string PLUGIN_NAME = "Sephiria Backpack Organizer";
-        public const string PLUGIN_VERSION = "2.4.0";
+        public const string PLUGIN_VERSION = "2.4.3";
     }
 }
