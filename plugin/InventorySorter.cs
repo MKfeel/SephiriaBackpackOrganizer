@@ -202,6 +202,8 @@ namespace SephiriaBackpackOrganizer
             public bool isCyclicRowCategory; // Charm_3Elemental_ByRow（凯尔萨德尼钥匙）
             public string originalRowCategory;
             public string targetRowCategory;
+            public bool isEternalEclipse;  // Charm_FireIceWeapon（永恒蚀：按冰霜武具/太阳剑数量决定左/右三列）
+            public bool isOpposingScale;   // Charm_FireIce（对立之秤：左侧Fire右侧Ice，按冰川/余烬数量决定最左/最右列）
             public int enchant;
             public int maxLevel;
             public ItemEntity entity;
@@ -275,6 +277,10 @@ namespace SephiriaBackpackOrganizer
             public List<WhitePaperComboTarget> whitePaperTargets = new List<WhitePaperComboTarget>();
             public int[] whitePaperAssignmentScratch = new int[0];
             public int[] mysticFactor = new int[0]; // 神秘地块等级倍率（默认 1；神秘藏品≥2时1格×2，≥5时4格×2）
+            public int frostCount;        // 冰霜武具(FROST)分类藏品数（永恒蚀摆位依据）
+            public int flameSwordCount;   // 太阳剑(FLAMESWORD)分类藏品数（永恒蚀摆位依据）
+            public int glacierCount;      // 冰川(GLACIER)分类藏品数（对立之秤摆位依据）
+            public int emberCount;        // 余烬(EMBER)分类藏品数（对立之秤摆位依据）
             public int mysticCount;                  // 神秘分类藏品数量（游戏组合计数）
             public int mysticActiveCells;            // 实际生效的 ×2 地块数
             public int[] cellLevel = new int[0];  // 评估时复用缓冲
@@ -370,6 +376,8 @@ namespace SephiriaBackpackOrganizer
                     {
                         info.magicCd = mg.ContainedMagic.cooldownTime;
                     }
+                    info.isEternalEclipse = s.charm is Charm_FireIceWeapon;
+                    info.isOpposingScale = s.charm is Charm_FireIce;
                     info.isCompass = s.charm is Charm_UpCharmDamage;
                     info.isAttackable = s.charm is IAttackableCharm ac && ac.IsAttackableCharm();
                     info.isWhitePaper = s.charm is Charm_WhitePaper;
@@ -426,6 +434,18 @@ namespace SephiriaBackpackOrganizer
                                         break;
                                     }
                                 }
+                                // 强制指定优先级（格式 key:数字，覆盖稀有度映射与强制1级；最后匹配生效）
+                                foreach (string pair in plugin.ForcedPriorityItems.Value.Split(new[] { ',', ';' },
+                                             StringSplitOptions.RemoveEmptyEntries))
+                                {
+                                    string[] kv = pair.Split(':');
+                                    if (kv.Length == 2 && info.entity.aName.key.Trim() == kv[0].Trim() &&
+                                        int.TryParse(kv[1], out int fp) && fp >= 1 && fp <= 4)
+                                    {
+                                        info.priority = fp;
+                                        break;
+                                    }
+                                }
                                 // 优先豁免格物品（如冰冷的锁：有解锁石板就尽可能利用）
                                 foreach (string key in plugin.IgnoreCellPreferredItems.Value.Split(new[] { ',', ';' },
                                              StringSplitOptions.RemoveEmptyEntries))
@@ -474,6 +494,16 @@ namespace SephiriaBackpackOrganizer
                                     if (info.entity.aName.key.Trim() == key.Trim())
                                     {
                                         info.isHourglass = true;
+                                        break;
+                                    }
+                                }
+                                // 永恒蚀类（可扩展；类识别已覆盖默认物品）
+                                foreach (string key in plugin.EclipseItems.Value.Split(new[] { ',', ';' },
+                                             StringSplitOptions.RemoveEmptyEntries))
+                                {
+                                    if (info.entity.aName.key.Trim() == key.Trim())
+                                    {
+                                        info.isEternalEclipse = true;
                                         break;
                                     }
                                 }
@@ -641,8 +671,40 @@ namespace SephiriaBackpackOrganizer
                 ctx.baseLevel[i] = (factor > 1 ? real / factor : real) - currentStele[i] - enchant;
             }
 
+            // 统计冰霜武具(FROST)/太阳剑(FLAMESWORD)分类藏品数（永恒蚀摆位依据）
+            foreach (ItemInfo it in ctx.items)
+            {
+                if (it.entity == null || it.entity.categories == null)
+                {
+                    continue;
+                }
+                if (it.entity.categories.Contains(EclipseFrostCategory))
+                {
+                    ctx.frostCount++;
+                }
+                if (it.entity.categories.Contains(EclipseFlameSwordCategory))
+                {
+                    ctx.flameSwordCount++;
+                }
+                if (it.entity.categories.Contains(ScaleGlacierCategory))
+                {
+                    ctx.glacierCount++;
+                }
+                if (it.entity.categories.Contains(ScaleEmberCategory))
+                {
+                    ctx.emberCount++;
+                }
+            }
+
             return ctx;
         }
+
+        /// <summary>永恒蚀摆位用的分类标签：冰霜武具 / 太阳剑（与游戏 categories 标签一致）。</summary>
+        internal const string EclipseFrostCategory = "FROST";
+        internal const string EclipseFlameSwordCategory = "FLAMESWORD";
+        /// <summary>对立之秤摆位用的分类标签：冰川 / 余烬。</summary>
+        internal const string ScaleGlacierCategory = "GLACIER";
+        internal const string ScaleEmberCategory = "EMBER";
 
         /// <summary>
         /// 凯尔萨德尼钥匙（Charm_3Elemental_ByRow）按行号每四行循环：
@@ -1639,6 +1701,37 @@ namespace SephiriaBackpackOrganizer
                     score -= 100000000d;
                 }
 
+                // 永恒蚀（Charm_FireIceWeapon）：冰霜武具>太阳剑 时须在右三列，少于时须在左三列（强约束，同行锁定同级）
+                if (info.isEternalEclipse && ctx.frostCount != ctx.flameSwordCount)
+                {
+                    int ex = cell % ctx.width;
+                    bool eclipseRight = ctx.frostCount > ctx.flameSwordCount;
+                    if ((eclipseRight && ex < ctx.width / 2) || (!eclipseRight && ex >= ctx.width / 2))
+                    {
+                        score -= 100000000d;
+                    }
+                }
+
+                // 对立之秤（Charm_FireIce）：冰川>余烬 须在最右列，少于须在最左列；相等时只能最左或最右列（禁止中间）
+                if (info.isOpposingScale)
+                {
+                    int sx = cell % ctx.width;
+                    bool leftOk = sx == 0;
+                    bool rightOk = sx == ctx.width - 1;
+                    if (ctx.glacierCount > ctx.emberCount)
+                    {
+                        if (!rightOk) score -= 100000000d;
+                    }
+                    else if (ctx.glacierCount < ctx.emberCount)
+                    {
+                        if (!leftOk) score -= 100000000d;
+                    }
+                    else if (!leftOk && !rightOk)
+                    {
+                        score -= 100000000d;
+                    }
+                }
+
                 // 受限护符位置偏好（引导搜索方向）：
                 // 冰锁类（preferIgnoreCells）站豁免格 +5000；普通受限站自然满足位置 +500
                 if (KindPriority(info.kind) >= 2)
@@ -2100,6 +2193,41 @@ namespace SephiriaBackpackOrganizer
                     }
                 }
 
+                if (it.isEternalEclipse)
+                {
+                    string rule;
+                    if (ctx.frostCount == ctx.flameSwordCount)
+                    {
+                        rule = "无限制（冰霜武具=太阳剑）";
+                    }
+                    else
+                    {
+                        bool right = ctx.frostCount > ctx.flameSwordCount;
+                        rule = $"{(right ? "右三列" : "左三列")}（冰霜武具{ctx.frostCount} > 太阳剑{ctx.flameSwordCount} = {(right ? "是" : "否")}）";
+                    }
+                    string pos = x < ctx.width / 2 ? "左三列" : "右三列";
+                    Plugin.Log.LogInfo($"{tag} 永恒蚀@{x},{y}（{pos}）：{rule}");
+                }
+
+                if (it.isOpposingScale)
+                {
+                    string rule;
+                    if (ctx.glacierCount > ctx.emberCount)
+                    {
+                        rule = $"最右列（冰川{ctx.glacierCount} > 余烬{ctx.emberCount}）";
+                    }
+                    else if (ctx.glacierCount < ctx.emberCount)
+                    {
+                        rule = $"最左列（冰川{ctx.glacierCount} < 余烬{ctx.emberCount}）";
+                    }
+                    else
+                    {
+                        rule = $"最左/最右列（冰川{ctx.glacierCount} = 余烬{ctx.emberCount}）";
+                    }
+                    string pos = x == 0 ? "最左列" : (x == ctx.width - 1 ? "最右列" : "中间");
+                    Plugin.Log.LogInfo($"{tag} 对立之秤@{x},{y}（{pos}）：{rule}");
+                }
+
                 if (it.isCyclicRowCategory)
                 {
                     int categoryIndex = y % CyclicRowCategories.Length;
@@ -2163,7 +2291,7 @@ namespace SephiriaBackpackOrganizer
             int telescopes = 0, compasses = 0, burdens = 0, attackable = 0, planets = 0, enchanted = 0, enchantSum = 0;
             int weaponRelated = 0, weaponMatched = 0;
             int dedicationBadges = 0, dedicationCompanions = 0;
-            int hourglasses = 0, magicBooks = 0;
+            int hourglasses = 0, magicBooks = 0, eclipses = 0, scales = 0;
             int[] rarityCount = new int[5];
             int[] priorityCount = new int[5];
             foreach (ItemInfo it in ctx.items)
@@ -2178,6 +2306,8 @@ namespace SephiriaBackpackOrganizer
                 if (it.isDedicationCompanion) dedicationCompanions++;
                 if (it.isHourglass) hourglasses++;
                 if (it.isMagicBook) magicBooks++;
+                if (it.isEternalEclipse) eclipses++;
+                if (it.isOpposingScale) scales++;
                 if (it.isCharm && !it.isBurden)
                 {
                     rarityCount[(int)it.rarity]++;
@@ -2202,6 +2332,8 @@ namespace SephiriaBackpackOrganizer
                 $" 附魔{enchanted}件(+{enchantSum}) 武器相关{weaponRelated}(匹配{weaponMatched})" +
                 $" 奉献徽章{dedicationBadges} 同伴{dedicationCompanions}" +
                 $" 沙漏{hourglasses} 魔法书{magicBooks} 白纸{ctx.whitePapers.Count}" +
+                $" 永恒蚀{eclipses}(冰霜武具{ctx.frostCount}/太阳剑{ctx.flameSwordCount})" +
+                $" 对立之秤{scales}(冰川{ctx.glacierCount}/余烬{ctx.emberCount})" +
                 $" 优先级[P1:{priorityCount[1]} P2:{priorityCount[2]} P3:{priorityCount[3]} P4:{priorityCount[4]}]" +
                 $" 稀有度[普通{rarityCount[0]} 优秀{rarityCount[1]} 稀有{rarityCount[2]} 传说{rarityCount[3]} 永恒{rarityCount[4]}]");
 
@@ -2716,6 +2848,14 @@ namespace SephiriaBackpackOrganizer
 
             bool restricted = KindPriority(charm.kind) >= 2;
 
+            // 永恒蚀：冰霜武具>太阳剑 → 只允许右三列；少于 → 只允许左三列（区域内无空位时放宽兜底）
+            bool eclipseRestricted = charm.isEternalEclipse && ctx.frostCount != ctx.flameSwordCount;
+            bool eclipseRight = ctx.frostCount > ctx.flameSwordCount;
+            // 对立之秤：冰川>余烬 → 最右列；少于 → 最左列；相等 → 最左或最右列（边缘无空位时放宽兜底）
+            bool scaleRestricted = charm.isOpposingScale;
+            bool scaleRight = ctx.glacierCount > ctx.emberCount;
+            bool scaleLeft = ctx.glacierCount < ctx.emberCount;
+
             for (int cell = 0; cell < ctx.storage; cell++)
             {
                 if (occupied[cell])
@@ -2731,6 +2871,33 @@ namespace SephiriaBackpackOrganizer
                 if (charm.isHourglass && x == ctx.width - 1)
                 {
                     continue; // 沙漏：最右列右边没有格子，永远配不上魔法书
+                }
+                if (eclipseRestricted)
+                {
+                    if (eclipseRight && x < ctx.width / 2)
+                    {
+                        continue; // 冰霜多：只能在右三列
+                    }
+                    if (!eclipseRight && x >= ctx.width / 2)
+                    {
+                        continue; // 太阳剑多：只能在左三列
+                    }
+                }
+                if (scaleRestricted)
+                {
+                    bool atEdge = x == 0 || x == ctx.width - 1;
+                    if (scaleRight && !(x == ctx.width - 1))
+                    {
+                        continue; // 冰川多：只能最右列
+                    }
+                    if (scaleLeft && !(x == 0))
+                    {
+                        continue; // 余烬多：只能最左列
+                    }
+                    if (!scaleRight && !scaleLeft && !atEdge)
+                    {
+                        continue; // 相等：只能最左/最右列，禁止中间
+                    }
                 }
                 bool isIgnore = ctx.ignore[cell];
                 bool natural = IsSatisfyingCell(ctx.inv, charm.kind, x, y, cell, ctx.storage, ctx.width);
@@ -2804,6 +2971,23 @@ namespace SephiriaBackpackOrganizer
                     // 普通受限：自然位置 > 豁免格 > 任意
                     if (bestNatural >= 0) return bestNatural;
                     if (bestIgnore >= 0) return bestIgnore;
+                }
+            }
+            // 永恒蚀/对立之秤：规定位置无任何空位时放宽（按等级分选全背包最优），避免摆不下
+            if ((eclipseRestricted || scaleRestricted) && bestAny < 0)
+            {
+                for (int cell = 0; cell < ctx.storage; cell++)
+                {
+                    if (occupied[cell])
+                    {
+                        continue;
+                    }
+                    float sc = ctx.cellLevel[cell] * 100f * ctx.mysticFactor[cell] - (ctx.disabled[cell] ? 500f : 0f);
+                    if (sc > bestAnyScore)
+                    {
+                        bestAnyScore = sc;
+                        bestAny = cell;
+                    }
                 }
             }
             return bestAny;

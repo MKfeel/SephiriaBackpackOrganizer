@@ -2,8 +2,10 @@ using System;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+#if !BEPINEX5
 using BepInEx.Unity.Mono;
 using BepInEx.Unity.Mono.Configuration;
+#endif
 using Mirror;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -16,7 +18,13 @@ namespace SephiriaBackpackOrganizer
     /// 使护符摆放在高等级格位上、石板效果覆盖最大化。
     /// </summary>
     [BepInPlugin(PluginInfo.PLUGIN_GUID, PluginInfo.PLUGIN_NAME, PluginInfo.PLUGIN_VERSION)]
-    public class Plugin : BaseUnityPlugin
+#if BEPINEX5
+    // BepInEx 5：BepInEx.BaseUnityPlugin（Unity Mono，MonoBehaviour，自带 Awake/Update 消息）
+    public class Plugin : BepInEx.BaseUnityPlugin
+#else
+    // BepInEx 6：BepInEx.Unity.Mono.BaseUnityPlugin（MonoBehaviour，自带 Awake/Update 消息）
+    public class Plugin : BepInEx.Unity.Mono.BaseUnityPlugin
+#endif
     {
         internal static Plugin Instance;
         internal static ManualLogSource Log;
@@ -50,6 +58,7 @@ namespace SephiriaBackpackOrganizer
         internal ConfigEntry<int> PriorityLegend;
         internal ConfigEntry<int> PriorityEternal;
         internal ConfigEntry<string> PriorityFixedItems;
+        internal ConfigEntry<string> ForcedPriorityItems;
         internal ConfigEntry<string> IgnoreCellPreferredItems;
         internal ConfigEntry<float> PriorityWeight1;
         internal ConfigEntry<float> PriorityWeight2;
@@ -64,6 +73,8 @@ namespace SephiriaBackpackOrganizer
         internal ConfigEntry<float> DedicationCompanionBonus;
         internal ConfigEntry<string> HourglassItems;
         internal ConfigEntry<float> HourglassBonus;
+        internal ConfigEntry<string> EclipseItems;
+        internal ConfigEntry<string> OpposingScaleItems;
         internal ConfigEntry<float> WhitePaperComboBonus;
         internal ConfigEntry<float> CompassBonus;
         internal ConfigEntry<float> CompassUnpairedFactor;
@@ -167,9 +178,14 @@ namespace SephiriaBackpackOrganizer
                 new ConfigDescription("羁绊/永恒(Eternal)优先级", new AcceptableValueRange<int>(1, 4)));
 
             PriorityFixedItems = Config.Bind("Priority", "FixedHighPriorityItems",
-                "Item_ColdLock_Name,Item_SweepRange_Name,Item_SweepRange_Enhanced_Name,Item_MiniBossFight_Name",
+                "Item_ColdLock_Name,Item_SweepRange_Name,Item_SweepRange_Enhanced_Name,Item_MiniBossFight_Name,Item_FrostRelicStack_Name",
                 "强制最高优先级(1级)的特定藏品 LocalizedString key（逗号分隔）。" +
-                "默认：冰冷的锁、丢弃的金戒指、绝对戒指、红茶叶袋（效果重要，即使稀有度不高）");
+                "默认：冰冷的锁、丢弃的金戒指、绝对戒指、红茶叶袋、冰星（效果重要，即使稀有度不高）");
+
+            ForcedPriorityItems = Config.Bind("Priority", "ForcedPriorityItems",
+                "Item_ScytheOfBerut_Name:3,Item_IceHammer_Name:2",
+                "强制指定优先级的藏品（格式 key:优先级，逗号分隔多个；1最高~4最低，覆盖稀有度映射与强制1级配置）。" +
+                "默认：贝鲁特之镰降为3级（其效果依赖暴击溢出，权重不高）；暴风雪之锤升为2级");
 
             IgnoreCellPreferredItems = Config.Bind("Priority", "IgnoreCellPreferredItems",
                 "Item_ColdLock_Name",
@@ -225,6 +241,16 @@ namespace SephiriaBackpackOrganizer
                     "CD 越长奖励越高 → 搜索会把沙漏放到 CD 最长的魔法书左边",
                     new AcceptableValueRange<float>(0f, 50000f)));
 
+            EclipseItems = Config.Bind("Synergy", "EclipseItems",
+                "",
+                "永恒蚀类藏品 LocalizedString key（逗号分隔；默认类识别已覆盖 Charm_FireIceWeapon）。" +
+                "摆位规则：背包中冰霜武具(FROST)藏品多于太阳剑(FLAMESWORD)时放右三列，少于时放左三列，相等/皆无则不限");
+
+            OpposingScaleItems = Config.Bind("Synergy", "OpposingScaleItems",
+                "",
+                "对立之秤类藏品 LocalizedString key（逗号分隔；默认类识别已覆盖 Charm_FireIce）。" +
+                "摆位规则：冰川(GLACIER)藏品多于余烬(EMBER)时放最右列，少于时放最左列，相等/皆无时只能最左或最右列");
+
             WhitePaperComboBonus = Config.Bind("Synergy", "WhitePaperComboBonus", 5000f,
                 new ConfigDescription("白纸夹在两件同连击神器中间时的补位评分权重（0=关闭）。" +
                     "优先当前数量最大但尚未达到最高效果档位的连击；例如坚固 9/10 时优先用白纸补到 10",
@@ -265,7 +291,8 @@ namespace SephiriaBackpackOrganizer
                         $"按 [{Hotkey.Value}] 整理背包（当前模式: {Mode.Value}）");
         }
 
-        private void Update()
+        /// <summary>每帧轮询逻辑（热键检测/会话诊断/自动整理）。两个 BepInEx 版本均由 MonoBehaviour Update 消息调用。</summary>
+        private void Tick()
         {
             if (sorter == null || sorter.Busy)
             {
@@ -312,6 +339,11 @@ namespace SephiriaBackpackOrganizer
                     autoSortedThisSession = false;
                 }
             }
+        }
+
+        private void Update()
+        {
+            Tick();
         }
 
         /// <summary>
@@ -392,6 +424,6 @@ namespace SephiriaBackpackOrganizer
     {
         public const string PLUGIN_GUID = "com.sephiria.backpack-organizer";
         public const string PLUGIN_NAME = "Sephiria Backpack Organizer";
-        public const string PLUGIN_VERSION = "2.4.3";
+        public const string PLUGIN_VERSION = "2.4.6";
     }
 }

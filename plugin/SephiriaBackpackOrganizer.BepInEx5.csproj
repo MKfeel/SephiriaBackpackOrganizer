@@ -1,33 +1,31 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- BepInEx 5 兼容构建：定义 BEPINEX5 符号，引用 BepInEx 5 的 BepInEx.dll（plugin/libs-bep5） -->
   <PropertyGroup>
     <TargetFramework>net472</TargetFramework>
     <LangVersion>latest</LangVersion>
     <AssemblyName>SephiriaBackpackOrganizer</AssemblyName>
     <RootNamespace>SephiriaBackpackOrganizer</RootNamespace>
     <Version>2.4.6</Version>
+    <DefineConstants>$(DefineConstants);BEPINEX5</DefineConstants>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <DebugType>embedded</DebugType>
     <!-- 隐藏本机构建路径（异常堆栈不泄露 C:\Users\... 等绝对路径） -->
     <PathMap>$(MSBuildProjectDirectory)=SephiriaBackpackOrganizer</PathMap>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
-    <!-- 排除 BepInEx5 项目的中间/输出目录（同目录下默认通配符会误包含其自动生成的 AssemblyInfo） -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);obj5\**;bin5\**</DefaultItemExcludes>
+    <!-- 输出到独立目录，避免与 BepInEx 6 构建互相覆盖 -->
+    <OutputPath>bin5\Release\</OutputPath>
+    <!-- 独立中间目录：与 6 版 csproj 同目录，默认 obj/ 会互相覆盖导致条件编译不生效 -->
+    <BaseIntermediateOutputPath>obj5\</BaseIntermediateOutputPath>
+    <!-- 排除 6 版项目的中间/输出目录（同目录下默认通配符会误包含其自动生成的 AssemblyInfo） -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;bin\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- BepInEx 6 (Unity Mono) -->
-    <Reference Include="BepInEx.Core">
-      <HintPath>C:\Users\DELL\bepinex-test\BepInEx\core\BepInEx.Core.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="BepInEx.Unity.Mono">
-      <HintPath>C:\Users\DELL\bepinex-test\BepInEx\core\BepInEx.Unity.Mono.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="0Harmony">
-      <HintPath>C:\Users\DELL\bepinex-test\BepInEx\core\0Harmony.dll</HintPath>
+    <!-- BepInEx 5 (Unity Mono) -->
+    <Reference Include="BepInEx">
+      <HintPath>$(MSBuildProjectDirectory)\libs-bep5\BepInEx.dll</HintPath>
       <Private>false</Private>
     </Reference>
 
