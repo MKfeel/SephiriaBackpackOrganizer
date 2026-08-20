@@ -13,8 +13,8 @@ A BepInEx plugin for *Sephiria* (Steam AppID 2436940). Press **F8** to auto-arra
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/before.png" width="49%" alt="Before"/>
-  <img src="screenshots/after.png" width="49%" alt="After"/>
+  <img src="../screenshots/before.png" width="49%" alt="Before"/>
+  <img src="../screenshots/after.png" width="49%" alt="After"/>
 </p>
 
 Press **F8** to arrange your bag: before on the left, after on the right (install instructions below).
@@ -93,4 +93,4 @@ Delete `游戏目录/BepInEx/plugins/SephiriaBackpackOrganizer.dll`; to remove t
 
 ## License
 
-[MIT](LICENSE). This plugin does not modify any game files; for learning and personal use. Use at your own risk.
+[MIT](../LICENSE). This plugin does not modify any game files; for learning and personal use. Use at your own risk.

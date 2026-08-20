@@ -13,8 +13,8 @@
 ## 스크린샷
 
 <p align="center">
-  <img src="screenshots/before.png" width="49%" alt="정리 전"/>
-  <img src="screenshots/after.png" width="49%" alt="정리 후"/>
+  <img src="../screenshots/before.png" width="49%" alt="정리 전"/>
+  <img src="../screenshots/after.png" width="49%" alt="정리 후"/>
 </p>
 
 **F8**을 눌러 가방을 정리하세요: 왼쪽은 정리 전, 오른쪽은 정리 후입니다 (설치 방법은 아래 참조).
@@ -93,4 +93,4 @@
 
 ## 라이선스
 
-[MIT](LICENSE). 이 플러그인은 게임 파일을 수정하지 않습니다. 학습 및 개인 용도로 사용하세요. 사용에 따른 책임은 사용자에게 있습니다.
+[MIT](../LICENSE). 이 플러그인은 게임 파일을 수정하지 않습니다. 학습 및 개인 용도로 사용하세요. 사용에 따른 책임은 사용자에게 있습니다.

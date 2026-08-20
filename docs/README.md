@@ -13,8 +13,8 @@
 ## 截图
 
 <p align="center">
-  <img src="screenshots/before.png" width="49%" alt="整理前"/>
-  <img src="screenshots/after.png" width="49%" alt="整理后"/>
+  <img src="../screenshots/before.png" width="49%" alt="整理前"/>
+  <img src="../screenshots/after.png" width="49%" alt="整理后"/>
 </p>
 
 按 **F8** 一键整理背包：左侧整理前、右侧整理后（安装方法见下文）。
@@ -93,4 +93,4 @@
 
 ## 许可证
 
-[MIT](LICENSE)。本插件不修改任何游戏文件，仅供学习与个人使用；使用本插件产生的任何后果由使用者自行承担。
+[MIT](../LICENSE)。本插件不修改任何游戏文件，仅供学习与个人使用；使用本插件产生的任何后果由使用者自行承担。
