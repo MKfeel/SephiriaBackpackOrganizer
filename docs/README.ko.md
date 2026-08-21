@@ -3,6 +3,7 @@
 🌏 **언어 / Language**：[한국어](README.ko.md) · [English](README.en.md) · [中文](README.md)
 
 ![Downloads](https://img.shields.io/github/downloads/Infinite-Heaven/SephiriaBackpackOrganizer/total?label=Downloads&color=2f6fad)
+![往期下载量合计](https://img.shields.io/badge/%E5%BE%80%E6%9C%9F%E4%B8%8B%E8%BD%BD%E9%87%8F%E5%90%88%E8%AE%A1-802-2f6fad)
 
 *Sephiria*(Steam AppID 2436940)용 BepInEx 플러그인입니다. **F8**을 누르면 가방을 자동으로 정리해 석판 커버리지, 부적 위치 조건, 행성 클러스터, 하모니 크리스탈, 헌신 배지, 켈사르단니 열쇠 순환 행, 나침반 원래 대상 고정, 백지 콤보 채우기, 빛나는 모래시계 등 모든 시너지 메커니즘을 한 번에 발동시킵니다.
 

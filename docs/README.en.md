@@ -3,6 +3,7 @@
 🌏 **Language / 语言**：[English](README.en.md) · [中文](README.md) · [한국어](README.ko.md)
 
 ![Downloads](https://img.shields.io/github/downloads/Infinite-Heaven/SephiriaBackpackOrganizer/total?label=Downloads&color=2f6fad)
+![往期下载量合计](https://img.shields.io/badge/%E5%BE%80%E6%9C%9F%E4%B8%8B%E8%BD%BD%E9%87%8F%E5%90%88%E8%AE%A1-802-2f6fad)
 
 A BepInEx plugin for *Sephiria* (Steam AppID 2436940). Press **F8** to auto-arrange your inventory so all the synergy mechanics trigger at once: tablet coverage, charm position conditions, planet clusters, harmony crystals, dedication badges, the Kelsardanni Key cycle rows, compass original-target binding, white-paper combo filling and the glowing hourglass.
 
