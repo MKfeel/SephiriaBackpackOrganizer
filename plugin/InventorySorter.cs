@@ -188,6 +188,8 @@ namespace SephiriaBackpackOrganizer
             public bool isHourglass;         // Charm_RightSpellCooldownHelper（发光的沙漏：右边格魔法书 CD 变短）
             public bool isMagicBook;         // Charm_Magic（魔法书：ContainedMagic 提供 CD 与伤害）
             public float magicCd;            // 魔法书 CD 秒数（ActiveSkillEntity.cooldownTime）
+            public bool isRayShard;          // 雷伊星碎片（Item_DoubleMagic_Name：放在耗蓝最高的魔法书右侧）
+            public int magicMpCost;          // 魔法书耗蓝量（mpCostsByLevel 最大值）
             public bool isCompass;          // Charm_UpCharmDamage（指北针）
             public bool isAttackable;       // IAttackableCharm
             public bool isWhitePaper;       // Charm_WhitePaper（白纸：左右相邻神器共享分类时复制该连击）
@@ -380,6 +382,18 @@ namespace SephiriaBackpackOrganizer
                     if (info.isMagicBook && s.charm is Charm_Magic mg && mg.ContainedMagic != null)
                     {
                         info.magicCd = mg.ContainedMagic.cooldownTime;
+                        if (mg.ContainedMagic.mpCostsByLevel != null)
+                        {
+                            int maxCost = 0;
+                            foreach (int c in mg.ContainedMagic.mpCostsByLevel)
+                            {
+                                if (c > maxCost)
+                                {
+                                    maxCost = c;
+                                }
+                            }
+                            info.magicMpCost = maxCost;
+                        }
                     }
                     info.isEternalEclipse = s.charm is Charm_FireIceWeapon;
                     info.isOpposingScale = s.charm is Charm_FireIce;
@@ -536,6 +550,16 @@ namespace SephiriaBackpackOrganizer
                                     if (info.entity.aName.key.Trim() == key.Trim())
                                     {
                                         info.isHourglass = true;
+                                        break;
+                                    }
+                                }
+                                // 雷伊星碎片类（可扩展；默认 key Item_DoubleMagic_Name，也支持类名 token）
+                                foreach (string token in plugin.RayShardItems.Value.Split(new[] { ',', ';' },
+                                             StringSplitOptions.RemoveEmptyEntries))
+                                {
+                                    if (MatchesItemKey(info, token))
+                                    {
+                                        info.isRayShard = true;
                                         break;
                                     }
                                 }
@@ -2042,6 +2066,48 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
+            // 雷伊星碎片（Item_DoubleMagic_Name）：左侧一格是魔法书(Charm_Magic)时生效（与沙漏方向相反）。
+            // 评分奖励按魔法书耗蓝量——耗蓝越高收益越大，搜索会把碎片放到耗蓝最高的魔法书右侧。
+            if (plugin.RayShardBonus.Value > 0f)
+            {
+                for (int cell = 0; cell < storage; cell++)
+                {
+                    Slot rs = slots[cell];
+                    if (rs == null || !rs.hasItem || rs.charm == null)
+                    {
+                        continue;
+                    }
+                    if (!ctx.itemByInstance.TryGetValue(rs.instanceID, out ItemInfo shard) || shard == null || !shard.isRayShard)
+                    {
+                        continue;
+                    }
+                    bool sEnabled = !disabled[cell] &&
+                                    ((level[cell] + shard.enchant) * ctx.mysticFactor[cell]) >= 0 &&
+                                    CriteriaSatisfied(ctx, shard, slots, ignore[cell], cell) &&
+                                    (!shard.slot.charm.isWeaponRelatedCharm ||
+                                     (shard.slot.charm.WeaponController != null &&
+                                      shard.slot.charm.WeaponController.currentWeapon != null &&
+                                      shard.slot.charm.WeaponController.currentWeapon.weaponType == shard.slot.charm.relatedWeapon));
+                    if (!sEnabled)
+                    {
+                        continue;
+                    }
+                    int rx = cell % ctx.width;
+                    int ry = cell / ctx.width;
+                    Slot left = At(slots, rx - 1, ry, ctx.width, ctx.storage);
+                    if (left == null || !left.hasItem || left.charm == null)
+                    {
+                        continue;
+                    }
+                    if (!ctx.itemByInstance.TryGetValue(left.instanceID, out ItemInfo magic2) ||
+                        magic2 == null || !magic2.isMagicBook)
+                    {
+                        continue;
+                    }
+                    score += plugin.RayShardBonus.Value * Math.Max(0, magic2.magicMpCost);
+                }
+            }
+
             // 多用途腰带（Charm_WoodenBox 类）：启用时，背包最上行(y=0)每有一件神器，效果叠加一次。
             // 评分奖励第一行神器数量，引导搜索把神器堆满第一行（多块腰带只按一块计，避免重复叠加）。
             if (ctx.hasBelt && plugin.BeltRowBonus.Value > 0f)
@@ -2320,6 +2386,24 @@ namespace SephiriaBackpackOrganizer
                     }
                 }
 
+                if (it.isRayShard)
+                {
+                    Slot left = At(slots, x - 1, y, w, ctx.storage);
+                    if (left != null && left.hasItem && left.charm is Charm_Magic)
+                    {
+                        int mp = 0;
+                        if (ctx.itemByInstance.TryGetValue(left.instanceID, out ItemInfo ri2) && ri2 != null)
+                        {
+                            mp = ri2.magicMpCost;
+                        }
+                        Plugin.Log.LogInfo($"{tag} 雷伊星碎片@{x},{y}：左侧魔法书耗蓝={mp}");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogInfo($"{tag} 雷伊星碎片@{x},{y}：左侧无魔法书（未配对）");
+                    }
+                }
+
                 if (it.isEternalEclipse)
                 {
                     string rule;
@@ -2434,7 +2518,7 @@ namespace SephiriaBackpackOrganizer
             int telescopes = 0, compasses = 0, burdens = 0, attackable = 0, planets = 0, enchanted = 0, enchantSum = 0;
             int weaponRelated = 0, weaponMatched = 0;
             int dedicationBadges = 0, dedicationCompanions = 0;
-            int hourglasses = 0, magicBooks = 0, eclipses = 0, scales = 0;
+            int hourglasses = 0, magicBooks = 0, eclipses = 0, scales = 0, rayShards = 0;
             int belts = 0, lowValue = 0, minLevel = 0;
             int[] rarityCount = new int[5];
             int[] priorityCount = new int[5];
@@ -2450,6 +2534,7 @@ namespace SephiriaBackpackOrganizer
                 if (it.isDedicationCompanion) dedicationCompanions++;
                 if (it.isHourglass) hourglasses++;
                 if (it.isMagicBook) magicBooks++;
+                if (it.isRayShard) rayShards++;
                 if (it.isEternalEclipse) eclipses++;
                 if (it.isOpposingScale) scales++;
                 if (it.isBelt) belts++;
@@ -2478,7 +2563,7 @@ namespace SephiriaBackpackOrganizer
                 $" 神秘{ctx.mysticCount}个/×2地块{ctx.mysticActiveCells}格" +
                 $" 附魔{enchanted}件(+{enchantSum}) 武器相关{weaponRelated}(匹配{weaponMatched})" +
                 $" 奉献徽章{dedicationBadges} 同伴{dedicationCompanions}" +
-                $" 沙漏{hourglasses} 魔法书{magicBooks} 白纸{ctx.whitePapers.Count}" +
+                $" 沙漏{hourglasses} 魔法书{magicBooks} 雷伊星碎片{rayShards} 白纸{ctx.whitePapers.Count}" +
                 $" 永恒蚀{eclipses}(冰霜武具{ctx.frostCount}/太阳剑{ctx.flameSwordCount})" +
                 $" 对立之秤{scales}(冰川{ctx.glacierCount}/余烬{ctx.emberCount})" +
                 $" 腰带{belts} 低等级价值{lowValue} 最低等级目标{minLevel}" +
@@ -2721,6 +2806,34 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
+            // 2b5) 雷伊星碎片（Item_DoubleMagic_Name）：先放（自动避开最左列），记录其左侧格，
+            //      引导耗蓝最高的魔法书就位到碎片左侧
+            var rayShardLeftCells = new HashSet<int>();
+            var rayShards = remaining.FindAll(x => x.isRayShard);
+            foreach (ItemInfo shard in rayShards)
+            {
+                int cell = FindBestCharmCell(ctx, shard, result, occupied, slotsNow);
+                if (cell < 0)
+                {
+                    cell = FirstFree(occupied);
+                }
+                if (cell >= 0)
+                {
+                    result[cell] = shard.slot;
+                    occupied[cell] = true;
+                    remaining.Remove(shard);
+                    slotsNow = SlotsFromArray(result, storage);
+                    EvaluateLayout(ctx, slotsNow);
+                    int sx = cell % ctx.width;
+                    int sy = cell / ctx.width;
+                    int lidx = sy * ctx.width + (sx - 1);
+                    if (sx - 1 >= 0 && lidx >= 0 && lidx < ctx.storage && !occupied[lidx])
+                    {
+                        rayShardLeftCells.Add(lidx);
+                    }
+                }
+            }
+
             // 2c) 行星藏品聚到望远镜周围（望远镜已放置时）
             if (telescopeCell >= 0)
             {
@@ -2805,7 +2918,7 @@ namespace SephiriaBackpackOrganizer
             });
             foreach (ItemInfo charm in remaining)
             {
-                int cell = FindBestCharmCell(ctx, charm, result, occupied, slotsNow, harmonyNeighbors, dedicationRow, hourglassRightCells);
+                int cell = FindBestCharmCell(ctx, charm, result, occupied, slotsNow, harmonyNeighbors, dedicationRow, hourglassRightCells, rayShardLeftCells);
                 if (cell < 0)
                 {
                     cell = FirstFree(occupied);
@@ -2981,7 +3094,7 @@ namespace SephiriaBackpackOrganizer
         /// <summary>为护符挑选最佳格子：有满足条件(或豁免)的格子时只在这些格里选等级最高的；否则退而求其次。</summary>
         private static int FindBestCharmCell(SearchContext ctx, ItemInfo charm, Slot[] result, bool[] occupied,
             List<Slot> slotsNow, HashSet<int> harmonyNeighbors = null, int dedicationRow = -1,
-            HashSet<int> hourglassRightCells = null)
+            HashSet<int> hourglassRightCells = null, HashSet<int> rayShardLeftCells = null)
         {
             // 分档候选：自然满足位置格 / 豁免格(IgnoreCriteria) / 任意格
             int bestNatural = -1;
@@ -3016,6 +3129,10 @@ namespace SephiriaBackpackOrganizer
                 if (charm.isHourglass && x == ctx.width - 1)
                 {
                     continue; // 沙漏：最右列右边没有格子，永远配不上魔法书
+                }
+                if (charm.isRayShard && x == 0)
+                {
+                    continue; // 雷伊星碎片：最左列左边没有格子，永远配不上魔法书
                 }
                 if (eclipseRestricted)
                 {
@@ -3064,6 +3181,10 @@ namespace SephiriaBackpackOrganizer
                 if (charm.isMagicBook && hourglassRightCells != null && hourglassRightCells.Contains(cell))
                 {
                     sc += 8000f + charm.magicCd * 4000f; // 沙漏右边格：魔法书优先，CD 越长越优先
+                }
+                if (charm.isMagicBook && rayShardLeftCells != null && rayShardLeftCells.Contains(cell))
+                {
+                    sc += 8000f + charm.magicMpCost * 4000f; // 雷伊星碎片左侧格：魔法书优先，耗蓝越高越优先
                 }
                 if (ctx.mysticFactor[cell] > 1)
                 {
@@ -3636,8 +3757,10 @@ namespace SephiriaBackpackOrganizer
 
             List<Slot> finalLayout = ComputeBestLayout(inv, original, ctx, out double beforeScore, out double bestScore);
 
-            // 应用最优布局（仅一次权限周期）
-            float finalGameScore = ApplyAndScore(inv, finalLayout);
+            // 应用：与联机客户端一致——用交换/旋转"挪移"物品，不清空背包、不改写字典，
+            // 从机制上杜绝"清空重写导致物品丢失"的风险（主机/单机同样安全）
+            ApplyByMoves(inv, original, finalLayout);
+            float finalGameScore = SafeScore(inv);
             double finalOffline = EvaluateLayout(ctx, finalLayout);
             float beforeGame = SafeScoreBefore(inv, original);
 
@@ -3683,7 +3806,20 @@ namespace SephiriaBackpackOrganizer
                 return;
             }
 
-            // 执行：先交换位置，再旋转石板
+            // 执行：先交换位置，再旋转石板（不清空背包）
+            ApplyMoves(inv, swaps, rots);
+
+            sw.Stop();
+            Plugin.Log.LogInfo(
+                $"联机客户端整理完成（{sw.ElapsedMilliseconds}ms 计算，{swaps.Count} 次交换/{rots.Count} 处旋转）：" +
+                $"离线评分 {beforeScore:F0} -> {bestScore:F0}；布局 {ctx.items.Count} 件" +
+                $"（石板{ctx.steles.Count} 护符{ctx.charms.Count} 负担{ctx.burdens.Count}）");
+            Notify("整理完毕");
+        }
+
+        /// <summary>执行交换/旋转操作序列（主机与联机客户端通用）。</summary>
+        private static void ApplyMoves(GridInventory inv, List<(int a, int b)> swaps, List<(int pos, int count)> rots)
+        {
             foreach (var (a, b) in swaps)
             {
                 ItemPosition pa = inv.IdxToPos(a);
@@ -3698,13 +3834,15 @@ namespace SephiriaBackpackOrganizer
                     inv.DoClickAction(p);
                 }
             }
+        }
 
-            sw.Stop();
-            Plugin.Log.LogInfo(
-                $"联机客户端整理完成（{sw.ElapsedMilliseconds}ms 计算，{swaps.Count} 次交换/{rots.Count} 处旋转）：" +
-                $"离线评分 {beforeScore:F0} -> {bestScore:F0}；布局 {ctx.items.Count} 件" +
-                $"（石板{ctx.steles.Count} 护符{ctx.charms.Count} 负担{ctx.burdens.Count}）");
-            Notify("整理完毕");
+        /// <summary>用交换/旋转"挪移"把当前布局调整为目标布局（不清空背包、不改写字典）。</summary>
+        private static void ApplyByMoves(GridInventory inv, List<Slot> original, List<Slot> finalLayout)
+        {
+            var swaps = new List<(int a, int b)>();
+            var rots = new List<(int pos, int count)>();
+            BuildClientOps(inv, original, finalLayout, swaps, rots);
+            ApplyMoves(inv, swaps, rots);
         }
 
         /// <summary>把"当前布局→目标布局"转换为 交换(位置) + 旋转(位置×次数) 操作序列（逻辑推演，含位置与旋转追踪）。</summary>
@@ -3939,9 +4077,13 @@ namespace SephiriaBackpackOrganizer
             {
                 if (TryHourglassMove(ctx, slots, rng)) return;
             }
+            if (roll < 58 && plugin.RayShardBonus.Value > 0f)
+            {
+                if (TryRayShardMove(ctx, slots, rng)) return;
+            }
 
             // 随机移动/交换/旋转
-            if (roll < 72 && emptyIdx.Count > 0)
+            if (roll < 75 && emptyIdx.Count > 0)
             {
                 int a = itemIdx[rng.Next(itemIdx.Count)];
                 int b = emptyIdx[rng.Next(emptyIdx.Count)];
@@ -3949,7 +4091,7 @@ namespace SephiriaBackpackOrganizer
                 return;
             }
 
-            if (roll < 90)
+            if (roll < 92)
             {
                 if (itemIdx.Count >= 2)
                 {
@@ -4486,6 +4628,79 @@ namespace SephiriaBackpackOrganizer
             return false;
         }
 
+        /// <summary>雷伊星碎片配对：把碎片移到耗蓝最高的魔法书右侧（或把耗蓝高的魔法书移到碎片左侧）。</summary>
+        private bool TryRayShardMove(SearchContext ctx, List<Slot> slots, System.Random rng)
+        {
+            var shardIdx = new List<int>();
+            var magicIdx = new List<int>();
+            foreach (ItemInfo it in ctx.items)
+            {
+                if (!(slots[it.index] != null && slots[it.index].hasItem))
+                {
+                    continue;
+                }
+                if (it.isRayShard)
+                {
+                    shardIdx.Add(it.index);
+                }
+                else if (it.isMagicBook)
+                {
+                    magicIdx.Add(it.index);
+                }
+            }
+            if (shardIdx.Count == 0 || magicIdx.Count == 0)
+            {
+                return false;
+            }
+
+            // 耗蓝最高的魔法书优先配对（耗蓝越高，碎片放它右侧收益越大）
+            magicIdx.Sort((a, b) =>
+            {
+                int ca = ctx.itemByInstance.TryGetValue(slots[a].instanceID, out ItemInfo ia) && ia != null ? ia.magicMpCost : 0;
+                int cb = ctx.itemByInstance.TryGetValue(slots[b].instanceID, out ItemInfo ib) && ib != null ? ib.magicMpCost : 0;
+                return cb.CompareTo(ca);
+            });
+            int magic = magicIdx[rng.Next(Math.Min(2, magicIdx.Count))];
+            int mx = magic % ctx.width;
+            int my = magic / ctx.width;
+
+            // 方式1：把某块碎片移到这本魔法书右边格（空格或可交换格）
+            if (mx + 1 < ctx.width)
+            {
+                int right = my * ctx.width + (mx + 1);
+                if (right >= 0 && right < ctx.storage &&
+                    !(slots[right] != null && slots[right].hasItem && slots[right].charm is Charm_Magic))
+                {
+                    int sh = shardIdx[rng.Next(shardIdx.Count)];
+                    if (right != sh)
+                    {
+                        SwapSlots(slots, sh, right);
+                        return true;
+                    }
+                }
+            }
+
+            // 方式2：把耗蓝最高的魔法书移到某块碎片左侧格（空格或可交换格）
+            int sd = shardIdx[rng.Next(shardIdx.Count)];
+            int sx = sd % ctx.width;
+            int sy = sd / ctx.width;
+            if (sx - 1 >= 0)
+            {
+                int left = sy * ctx.width + (sx - 1);
+                if (left >= 0 && left < ctx.storage &&
+                    !(slots[left] != null && slots[left].hasItem && slots[left].charm is Charm_Magic))
+                {
+                    if (left != magic)
+                    {
+                        SwapSlots(slots, magic, left);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         /// <summary>负担物品倾倒：把负面藏品移到当前最差的（负等级）格子。</summary>
         private bool TryBurdenDump(SearchContext ctx, List<Slot> slots, System.Random rng)
         {
@@ -4573,54 +4788,6 @@ namespace SephiriaBackpackOrganizer
             return slots;
         }
 
-        private static void ApplyState(GridInventory inv, List<Slot> slots)
-        {
-            for (int i = 0; i < inv.CurrentInventoryStorage; i++)
-            {
-                ItemPosition pos = inv.IdxToPos(i);
-                inv.inventoryMatrix.Remove(pos);
-                inv.charms.Remove(pos);
-                inv.stoneTablets.Remove(pos);
-            }
-
-            for (int j = 0; j < slots.Count && j < inv.CurrentInventoryStorage; j++)
-            {
-                Slot slot = slots[j];
-                if (!slot.hasItem)
-                {
-                    continue;
-                }
-
-                ItemPosition pos = inv.IdxToPos(j);
-                inv.inventoryMatrix[pos] = new NewItemOwnInstance(
-                    slot.instanceID, slot.entityID, pos.x, pos.y, slot.quantity, slot.charm, slot.tablet);
-
-                if (slot.charm != null)
-                {
-                    inv.charms[pos] = slot.charm;
-                    slot.charm.NetworkxIdx = pos.x;
-                    slot.charm.NetworkyIdx = pos.y;
-                }
-
-                if (slot.tablet != null)
-                {
-                    inv.stoneTablets[pos] = slot.tablet;
-                    slot.tablet.NetworkxIdx = pos.x;
-                    slot.tablet.NetworkyIdx = pos.y;
-                    slot.tablet.Networkrotation = slot.rotation;
-                }
-            }
-        }
-
-        private static float ApplyAndScore(GridInventory inv, List<Slot> slots)
-        {
-            using (new GridInventory.Permission(inv))
-            {
-                ApplyState(inv, slots);
-            }
-            return SafeScore(inv);
-        }
-
         private static float SafeScore(GridInventory inv)
         {
             if (!NetworkServer.active)
@@ -4668,7 +4835,9 @@ namespace SephiriaBackpackOrganizer
                 plugin.EnhancedTemperature.Value);
 
             List<Slot> finalLayout = result.Score >= before - 0.5 ? result.Best : original;
-            float finalGame = ApplyAndScore(inv, finalLayout);
+            // 自检同样用"交换/旋转挪移"应用，避免清空重写的中间态风险
+            ApplyByMoves(inv, original, finalLayout);
+            float finalGame = SafeScore(inv);
             double finalOffline = EvaluateLayout(ctx, finalLayout);
 
             LogLayoutGrid(ctx, finalLayout, "自检");

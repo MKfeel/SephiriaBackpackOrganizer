@@ -77,6 +77,8 @@ namespace SephiriaBackpackOrganizer
         internal ConfigEntry<float> DedicationCompanionBonus;
         internal ConfigEntry<string> HourglassItems;
         internal ConfigEntry<float> HourglassBonus;
+        internal ConfigEntry<string> RayShardItems;
+        internal ConfigEntry<float> RayShardBonus;
         internal ConfigEntry<string> EclipseItems;
         internal ConfigEntry<string> OpposingScaleItems;
         internal ConfigEntry<float> WhitePaperComboBonus;
@@ -265,6 +267,16 @@ namespace SephiriaBackpackOrganizer
             HourglassBonus = Config.Bind("Synergy", "HourglassBonus", 6000f,
                 new ConfigDescription("沙漏右边有魔法书时，按魔法书 CD 秒数的评分奖励（0=关闭）。" +
                     "CD 越长奖励越高 → 搜索会把沙漏放到 CD 最长的魔法书左边",
+                    new AcceptableValueRange<float>(0f, 50000f)));
+
+            RayShardItems = Config.Bind("Synergy", "RayShardItems",
+                "Item_DoubleMagic_Name",
+                "雷伊星碎片类藏品 LocalizedString key（逗号分隔，也支持类名 token）。" +
+                "效果：放在耗蓝量最高的魔法书右侧（与沙漏方向相反）");
+
+            RayShardBonus = Config.Bind("Synergy", "RayShardBonus", 4000f,
+                new ConfigDescription("雷伊星碎片左侧有魔法书时，按魔法书耗蓝量的评分奖励（0=关闭）。" +
+                    "耗蓝越高奖励越高 → 搜索会把碎片放到耗蓝最高的魔法书右侧",
                     new AcceptableValueRange<float>(0f, 50000f)));
 
             EclipseItems = Config.Bind("Synergy", "EclipseItems",
@@ -459,6 +471,6 @@ namespace SephiriaBackpackOrganizer
     {
         public const string PLUGIN_GUID = "com.sephiria.backpack-organizer";
         public const string PLUGIN_NAME = "Sephiria Backpack Organizer";
-        public const string PLUGIN_VERSION = "2.4.7";
+        public const string PLUGIN_VERSION = "2.4.8";
     }
 }
