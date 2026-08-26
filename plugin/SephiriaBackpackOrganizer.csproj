@@ -5,7 +5,9 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>SephiriaBackpackOrganizer</AssemblyName>
     <RootNamespace>SephiriaBackpackOrganizer</RootNamespace>
-    <Version>2.4.9</Version>
+    <Version>2.5.0</Version>
+    <GameDirectory Condition="'$(GameDirectory)' == ''">E:\steam\steamapps\common\Sephiria</GameDirectory>
+    <BepInExCoreDirectory Condition="'$(BepInExCoreDirectory)' == ''">$(GameDirectory)\BepInEx\core</BepInExCoreDirectory>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <DebugType>embedded</DebugType>
     <!-- 隐藏本机构建路径（异常堆栈不泄露 C:\Users\... 等绝对路径） -->
@@ -19,45 +21,57 @@
   <ItemGroup>
     <!-- BepInEx 6 (Unity Mono) -->
     <Reference Include="BepInEx.Core">
-      <HintPath>C:\Users\DELL\bepinex-test\BepInEx\core\BepInEx.Core.dll</HintPath>
+      <HintPath>$(BepInExCoreDirectory)\BepInEx.Core.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="BepInEx.Unity.Mono">
-      <HintPath>C:\Users\DELL\bepinex-test\BepInEx\core\BepInEx.Unity.Mono.dll</HintPath>
+      <HintPath>$(BepInExCoreDirectory)\BepInEx.Unity.Mono.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>C:\Users\DELL\bepinex-test\BepInEx\core\0Harmony.dll</HintPath>
+      <HintPath>$(BepInExCoreDirectory)\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
 
     <!-- 游戏程序集 (Sephiria, E:\SteamLibrary) -->
     <Reference Include="Assembly-CSharp">
-      <HintPath>E:\SteamLibrary\steamapps\common\Sephiria\Sephiria_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Mirror">
-      <HintPath>E:\SteamLibrary\steamapps\common\Sephiria\Sephiria_Data\Managed\Mirror.dll</HintPath>
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\Mirror.dll</HintPath>
       <Private>false</Private>
     </Reference>
 
     <!-- Unity 引擎 -->
     <Reference Include="UnityEngine">
-      <HintPath>E:\SteamLibrary\steamapps\common\Sephiria\Sephiria_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>E:\SteamLibrary\steamapps\common\Sephiria\Sephiria_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.InputLegacyModule">
-      <HintPath>E:\SteamLibrary\steamapps\common\Sephiria\Sephiria_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\UnityEngine.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\UnityEngine.UIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\Unity.TextMeshPro.dll</HintPath>
       <Private>false</Private>
     </Reference>
 
     <!-- 新输入系统（游戏实际使用） -->
     <Reference Include="Unity.InputSystem">
-      <HintPath>E:\SteamLibrary\steamapps\common\Sephiria\Sephiria_Data\Managed\Unity.InputSystem.dll</HintPath>
+      <HintPath>$(GameDirectory)\Sephiria_Data\Managed\Unity.InputSystem.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

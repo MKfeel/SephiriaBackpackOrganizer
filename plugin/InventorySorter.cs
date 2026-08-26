@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using Mirror;
 using UnityEngine;
 
@@ -48,7 +49,8 @@ namespace SephiriaBackpackOrganizer
         private readonly Plugin plugin;
         private bool busy;
         private float sessionStartTime = -1f;
-        private SortJobState pendingSort;   // 异步整理任务（计算/应用分帧）
+        private Task<SearchOutcome> pendingSearch;
+        private PendingEnhancedSort pendingEnhanced;
 
         public bool Busy => busy;
 
@@ -92,44 +94,6 @@ namespace SephiriaBackpackOrganizer
             public static Slot Empty() => new Slot();
         }
 
-        /// <summary>步进式退火状态（每帧执行预算内的迭代，避免主线程长阻塞）。</summary>
-        private sealed class AnnealState
-        {
-            public List<Slot> best;
-            public double bestScore;
-            public List<Slot> candidate;
-            public double candidateScore;
-            public int restart;
-            public int iter;
-            public System.Random rng;
-            public int iterations;
-            public int restarts;
-            public float temp0;
-        }
-
-        /// <summary>异步整理任务状态机：计算分帧（多轮×多起点退火）+ 应用分帧（每帧少量 Swap）。</summary>
-        private sealed class SortJobState
-        {
-            public GridInventory inv;
-            public List<Slot> original;
-            public List<Slot> smartStart;
-            public SearchContext ctx;
-            public double beforeScore;
-            public double globalBest;
-            public List<Slot> bestLayout;
-            public int round;
-            public int startIdx;
-            public List<List<Slot>> starts;   // 当前轮起点
-            public AnnealState anneal;         // 当前起点退火（null = 取下一个）
-            public List<(int a, int b)> swaps;
-            public List<(int pos, int count)> rots;
-            public int applyIdx;               // 交换指针（先全部交换，再旋转）
-            public int rotIdx;
-            public bool computingDone;
-            public bool isClient;              // 联机客户端模式
-            public System.Diagnostics.Stopwatch clock = new System.Diagnostics.Stopwatch();
-        }
-
         // ---------------------------------------------------------------- 护符位置条件
 
         private enum CharmPositionKind
@@ -166,7 +130,7 @@ namespace SephiriaBackpackOrganizer
             return CharmPositionKind.None;
         }
 
-        private static bool IsSatisfyingCell(GridInventory inv, CharmPositionKind kind, int x, int y, int index, int storage, int width)
+        private static bool IsSatisfyingCell(CharmPositionKind kind, int x, int y, int index, int storage, int width)
         {
             switch (kind)
             {
@@ -217,6 +181,10 @@ namespace SephiriaBackpackOrganizer
             public Slot slot;
             public bool isStele;
             public bool isCharm;
+            public bool weaponOk = true;
+            public bool tabletRotatable;
+            public int steleImportance;
+            public int manualPriorityRank; // 0=未提权，1=最后提权（最高），2=次高……
             public bool isBurden;
             public bool isPlanetCategory;   // Entity.categories.Contains("PLANET")
             public bool excludeFromPlanetCluster; // 行星分类但不参与望远镜聚簇（如乐谱银河）
@@ -332,6 +300,52 @@ namespace SephiriaBackpackOrganizer
             public int[] cellLevel = new int[0];  // 评估时复用缓冲
             public bool[] disabled = new bool[0];
             public bool[] ignore = new bool[0];
+            public bool[] compassPairedScratch = new bool[0];
+            public int[] itemIndexScratch = new int[0];
+            public int[] emptyIndexScratch = new int[0];
+            public readonly List<int> moveScratchA = new List<int>();
+            public readonly List<int> moveScratchB = new List<int>();
+            public readonly List<int> moveScratchC = new List<int>();
+            public readonly List<int> moveScratchD = new List<int>();
+            public readonly HashSet<int> instanceSetScratch = new HashSet<int>();
+            public int annealEvaluations;
+            public int annealStarts;
+            public int annealStartsCompleted;
+            public bool searchBudgetReached;
+            public int manualPriorityCount;
+            public double manualPriorityStrength;
+        }
+
+        private sealed class SearchOutcome
+        {
+            public List<Slot> layout;
+            public double beforeScore;
+            public double bestScore;
+        }
+
+        private sealed class PendingEnhancedSort
+        {
+            public GridInventory inv;
+            public List<Slot> original;
+            public SearchContext ctx;
+            public float beforeGameScore;
+            public System.Diagnostics.Stopwatch stopwatch;
+            public SearchOutcome outcome;
+            public List<Slot> target;
+            public List<Slot> expected;
+            public readonly List<(int a, int b)> swaps = new List<(int a, int b)>();
+            public readonly List<(int pos, int count)> rotations = new List<(int pos, int count)>();
+            public int swapIndex;
+            public int rotationIndex;
+            public int rotationRemaining;
+            public bool applying;
+            public bool rollingBack;
+            public bool awaitingObservedState;
+            public readonly System.Diagnostics.Stopwatch acknowledgement = new System.Diagnostics.Stopwatch();
+            public int swapsPerFrame;
+            public int rotationClicksPerFrame;
+            public double frameBudgetMs;
+            public int acknowledgementTimeoutMs;
         }
 
         // ---------------------------------------------------------------- 石板查询解析
@@ -395,8 +409,24 @@ namespace SephiriaBackpackOrganizer
                 cellLevel = new int[storage],
                 disabled = new bool[storage],
                 ignore = new bool[storage],
-                mysticFactor = new int[storage]
+                compassPairedScratch = new bool[storage],
+                itemIndexScratch = new int[storage],
+                emptyIndexScratch = new int[storage],
+                mysticFactor = new int[storage],
+                manualPriorityStrength = Math.Max(1d, plugin.ManualPriorityStrength.Value)
             };
+
+            var presentCharmIds = new HashSet<int>();
+            for (int i = 0; i < original.Count; i++)
+            {
+                Slot slot = original[i];
+                if (slot != null && slot.hasItem && slot.charm != null)
+                {
+                    presentCharmIds.Add(slot.instanceID);
+                }
+            }
+            Dictionary<int, int> manualPriorityRanks = ManualPriorityManager.PruneAndSnapshot(presentCharmIds);
+            ctx.manualPriorityCount = manualPriorityRanks.Count;
 
             // 分类物品
             for (int i = 0; i < original.Count && i < storage; i++)
@@ -408,6 +438,12 @@ namespace SephiriaBackpackOrganizer
                 }
 
                 var info = new ItemInfo { index = i, slot = s, isStele = s.tablet != null, isCharm = s.charm != null };
+                manualPriorityRanks.TryGetValue(s.instanceID, out info.manualPriorityRank);
+                if (info.isStele)
+                {
+                    // GetQuery 属于游戏对象访问，只在主线程构建快照时读取。
+                    info.steleImportance = SteleImportance(s.tablet);
+                }
                 if (info.isCharm)
                 {
                     info.kind = GetPositionKind(s.charm);
@@ -441,6 +477,12 @@ namespace SephiriaBackpackOrganizer
                     info.isWhitePaper = s.charm is Charm_WhitePaper;
                     info.isCyclicRowCategory = s.charm is Charm_3Elemental_ByRow;
                     info.isBelt = s.charm is Charm_WoodenBox;
+                    if (s.charm.isWeaponRelatedCharm)
+                    {
+                        var wc = s.charm.WeaponController;
+                        info.weaponOk = wc != null && wc.currentWeapon != null &&
+                                        wc.currentWeapon.weaponType == s.charm.relatedWeapon;
+                    }
                 }
 
                 try
@@ -698,6 +740,7 @@ namespace SephiriaBackpackOrganizer
             foreach (ItemInfo stele in ctx.steles)
             {
                 bool rotatable = DungeonManager.IsTabletRotatable(stele.slot.tablet.instanceID, stele.slot.tablet.isRotatable);
+                stele.tabletRotatable = rotatable;
                 int rotations = rotatable ? 4 : 1;
                 var byCell = new Dictionary<int, StelePattern>();
                 for (int cell = 0; cell < storage; cell++)
@@ -1552,8 +1595,8 @@ namespace SephiriaBackpackOrganizer
                 return above.instanceID == targetInstanceID;
             }
 
-            return above.charm is Charm_UpCharmDamage ||
-                   (above.charm is IAttackableCharm ac && ac.IsAttackableCharm());
+            return ctx.itemByInstance.TryGetValue(above.instanceID, out ItemInfo aboveInfo) &&
+                   aboveInfo != null && (aboveInfo.isCompass || aboveInfo.isAttackable);
         }
 
         private static int CountBrokenCompassBindings(SearchContext ctx, List<Slot> slots)
@@ -1755,7 +1798,8 @@ namespace SephiriaBackpackOrganizer
             bool[] compassPaired = null;
             if (plugin.CompassBonus.Value > 0f)
             {
-                compassPaired = new bool[storage];
+                compassPaired = ctx.compassPairedScratch;
+                Array.Clear(compassPaired, 0, storage);
                 for (int cell = 0; cell < storage; cell++)
                 {
                     Slot cs = slots[cell];
@@ -1800,20 +1844,9 @@ namespace SephiriaBackpackOrganizer
 
                 int lvl = (level[cell] + info.enchant) * ctx.mysticFactor[cell];
                 // 武器相关护符：游戏内"武器匹配才启用"（flag3 = !isWeaponRelatedCharm || 当前武器类型匹配）
-                bool weaponOk;
-                if (!info.slot.charm.isWeaponRelatedCharm)
-                {
-                    weaponOk = true;
-                }
-                else
-                {
-                    var wc = info.slot.charm.WeaponController;
-                    weaponOk = wc != null && wc.currentWeapon != null &&
-                               wc.currentWeapon.weaponType == info.slot.charm.relatedWeapon;
-                }
                 bool enabled = !disabled[cell] && lvl >= 0 &&
                                CriteriaSatisfied(ctx, info, slots, ignore[cell], cell) &&
-                               weaponOk;
+                               info.weaponOk;
 
                 // 固定行物品必须保持原行；凯尔萨德尼钥匙则必须处于选中羁绊的同余行。
                 if (!IsAllowedLockedRow(info, cell / ctx.width))
@@ -1858,7 +1891,7 @@ namespace SephiriaBackpackOrganizer
                 {
                     int x = cell % ctx.width;
                     int y = cell / ctx.width;
-                    bool natural = IsSatisfyingCell(ctx.inv, info.kind, x, y, cell, ctx.storage, ctx.width);
+                    bool natural = IsSatisfyingCell(info.kind, x, y, cell, ctx.storage, ctx.width);
                     if (info.preferIgnoreCells)
                     {
                         if (ignore[cell])
@@ -1881,6 +1914,14 @@ namespace SephiriaBackpackOrganizer
                     int eff = Mathf.Clamp(lvl, 0, info.maxLevel);
                     // 指北针：效果只在配对时生效，未配对时等级分大幅打折
                     double levelScore = eff * 10000 * PriorityWeight(info.priority) * info.levelScoreFactor;
+                    if (info.manualPriorityRank > 0)
+                    {
+                        // 后点的排名更高：P1 获得完整强度，P2/P3…按平方衰减。
+                        // 使用独立加分而非乘稀有度权重，确保 P1 的手动权重始终高于 P2。
+                        // 只增加“等级价值”，不会绕过位置、禁用、固定行等硬约束。
+                        double rank = info.manualPriorityRank;
+                        levelScore += eff * 10000d * ctx.manualPriorityStrength / (rank * rank);
+                    }
                     if (info.isCompass && compassPaired != null && !compassPaired[cell])
                     {
                         levelScore *= plugin.CompassUnpairedFactor.Value;
@@ -1973,10 +2014,7 @@ namespace SephiriaBackpackOrganizer
                     bool hEnabled = !disabled[cell] &&
                                     ((level[cell] + harmony.enchant) * ctx.mysticFactor[cell]) >= 0 &&
                                     CriteriaSatisfied(ctx, harmony, slots, ignore[cell], cell) &&
-                                    (!harmony.slot.charm.isWeaponRelatedCharm ||
-                                     (harmony.slot.charm.WeaponController != null &&
-                                      harmony.slot.charm.WeaponController.currentWeapon != null &&
-                                      harmony.slot.charm.WeaponController.currentWeapon.weaponType == harmony.slot.charm.relatedWeapon));
+                                    harmony.weaponOk;
                     if (!hEnabled)
                     {
                         continue;
@@ -2026,10 +2064,7 @@ namespace SephiriaBackpackOrganizer
                     bool bEnabled = !disabled[cell] &&
                                     ((level[cell] + badge.enchant) * ctx.mysticFactor[cell]) >= 0 &&
                                     CriteriaSatisfied(ctx, badge, slots, ignore[cell], cell) &&
-                                    (!badge.slot.charm.isWeaponRelatedCharm ||
-                                     (badge.slot.charm.WeaponController != null &&
-                                      badge.slot.charm.WeaponController.currentWeapon != null &&
-                                      badge.slot.charm.WeaponController.currentWeapon.weaponType == badge.slot.charm.relatedWeapon));
+                                    badge.weaponOk;
                     if (!bEnabled)
                     {
                         continue;
@@ -2081,10 +2116,7 @@ namespace SephiriaBackpackOrganizer
                     bool gEnabled = !disabled[cell] &&
                                     ((level[cell] + hour.enchant) * ctx.mysticFactor[cell]) >= 0 &&
                                     CriteriaSatisfied(ctx, hour, slots, ignore[cell], cell) &&
-                                    (!hour.slot.charm.isWeaponRelatedCharm ||
-                                     (hour.slot.charm.WeaponController != null &&
-                                      hour.slot.charm.WeaponController.currentWeapon != null &&
-                                      hour.slot.charm.WeaponController.currentWeapon.weaponType == hour.slot.charm.relatedWeapon));
+                                    hour.weaponOk;
                     if (!gEnabled)
                     {
                         continue;
@@ -2123,10 +2155,7 @@ namespace SephiriaBackpackOrganizer
                     bool sEnabled = !disabled[cell] &&
                                     ((level[cell] + shard.enchant) * ctx.mysticFactor[cell]) >= 0 &&
                                     CriteriaSatisfied(ctx, shard, slots, ignore[cell], cell) &&
-                                    (!shard.slot.charm.isWeaponRelatedCharm ||
-                                     (shard.slot.charm.WeaponController != null &&
-                                      shard.slot.charm.WeaponController.currentWeapon != null &&
-                                      shard.slot.charm.WeaponController.currentWeapon.weaponType == shard.slot.charm.relatedWeapon));
+                                    shard.weaponOk;
                     if (!sEnabled)
                     {
                         continue;
@@ -2166,10 +2195,7 @@ namespace SephiriaBackpackOrganizer
                     bool bEnabled = !disabled[cell] &&
                                     ((level[cell] + belt.enchant) * ctx.mysticFactor[cell]) >= 0 &&
                                     CriteriaSatisfied(ctx, belt, slots, ignore[cell], cell) &&
-                                    (!belt.slot.charm.isWeaponRelatedCharm ||
-                                     (belt.slot.charm.WeaponController != null &&
-                                      belt.slot.charm.WeaponController.currentWeapon != null &&
-                                      belt.slot.charm.WeaponController.currentWeapon.weaponType == belt.slot.charm.relatedWeapon));
+                                    belt.weaponOk;
                     if (!bEnabled)
                     {
                         continue;
@@ -2649,11 +2675,10 @@ namespace SephiriaBackpackOrganizer
             Slot[] result = new Slot[storage];
             bool[] occupied = new bool[storage];
 
-            // 1) 石板：有负效果的优先摆，逐格逐旋转打分（含条件检查）
-            //    steleEffectCells：已放石板的加成格集合——贪心避开"站到别人加成格上"，
-            //    把加成留给护符（治本：修复智能初始评分退化）
+            // 1) 石板：有负效果的优先摆，逐格逐旋转打分（含条件检查）。
+            // 已放石板的效果格留给神器，避免后续石板吞掉正等级加成。
             var steles = new List<ItemInfo>(ctx.steles);
-            steles.Sort((a, b) => SteleImportance(b.slot).CompareTo(SteleImportance(a.slot)));
+            steles.Sort((a, b) => b.steleImportance.CompareTo(a.steleImportance));
             var steleEffectCells = new HashSet<int>();
             foreach (ItemInfo stele in steles)
             {
@@ -2661,7 +2686,7 @@ namespace SephiriaBackpackOrganizer
                 int bestRot = stele.slot.rotation;
                 float bestScore = float.MinValue;
 
-                int rotations = DungeonManager.IsTabletRotatable(stele.slot.tablet.instanceID, stele.slot.tablet.isRotatable) ? 4 : 1;
+                int rotations = stele.tabletRotatable ? 4 : 1;
                 for (int cell = 0; cell < storage; cell++)
                 {
                     if (occupied[cell])
@@ -2670,7 +2695,8 @@ namespace SephiriaBackpackOrganizer
                     }
                     for (int rot = 0; rot < rotations; rot++)
                     {
-                        if (ctx.stelePatterns.TryGetValue(stele.index, out var byCell) &&
+                        // stelePatterns 以石板 instanceID 为键；不能使用背包格子索引。
+                        if (ctx.stelePatterns.TryGetValue(stele.slot.instanceID, out var byCell) &&
                             byCell.TryGetValue(cell * 4 + rot, out var pattern))
                         {
                             float sc = EvaluateStelePattern(ctx, pattern, result, occupied, steleEffectCells);
@@ -2686,18 +2712,19 @@ namespace SephiriaBackpackOrganizer
 
                 if (bestIdx >= 0)
                 {
-                    stele.slot.rotation = bestRot;
-                    result[bestIdx] = stele.slot;
+                    // 智能起点必须保持纯函数：不能修改 ItemInfo.slot（它属于整理前校验快照）。
+                    Slot placedStele = stele.slot.Clone();
+                    placedStele.rotation = bestRot;
+                    result[bestIdx] = placedStele;
                     occupied[bestIdx] = true;
-                    // 记录该石板的效果格（供后续石板避开）
-                    if (ctx.stelePatterns.TryGetValue(stele.index, out var byCell2) &&
-                        byCell2.TryGetValue(bestIdx * 4 + bestRot, out var placedPattern))
+                    if (ctx.stelePatterns.TryGetValue(stele.slot.instanceID, out var byCell) &&
+                        byCell.TryGetValue(bestIdx * 4 + bestRot, out var placedPattern))
                     {
-                        foreach (EffectEntry e in placedPattern.effects)
+                        foreach (EffectEntry effect in placedPattern.effects)
                         {
-                            if (e.cell >= 0 && e.cell < storage)
+                            if (effect.cell >= 0 && effect.cell < storage)
                             {
-                                steleEffectCells.Add(e.cell);
+                                steleEffectCells.Add(effect.cell);
                             }
                         }
                     }
@@ -2720,7 +2747,8 @@ namespace SephiriaBackpackOrganizer
                 {
                     return p;
                 }
-                return a.priority.CompareTo(b.priority);
+                p = CompareManualPriority(a, b);
+                return p != 0 ? p : a.priority.CompareTo(b.priority);
             });
             foreach (ItemInfo charm in restricted)
             {
@@ -2731,7 +2759,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = charm.slot;
+                    result[cell] = charm.slot.Clone();
                     occupied[cell] = true;
                     remaining.Remove(charm);
                     slotsNow = SlotsFromArray(result, storage);
@@ -2750,7 +2778,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = rl.slot;
+                    result[cell] = rl.slot.Clone();
                     occupied[cell] = true;
                     remaining.Remove(rl);
                     slotsNow = SlotsFromArray(result, storage);
@@ -2766,7 +2794,7 @@ namespace SephiriaBackpackOrganizer
                 int cell = FindBestCharmCell(ctx, telescope, result, occupied, slotsNow);
                 if (cell >= 0)
                 {
-                    result[cell] = telescope.slot;
+                    result[cell] = telescope.slot.Clone();
                     occupied[cell] = true;
                     telescopeCell = cell;
                     remaining.Remove(telescope);
@@ -2787,7 +2815,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = hc.slot;
+                    result[cell] = hc.slot.Clone();
                     occupied[cell] = true;
                     remaining.Remove(hc);
                     slotsNow = SlotsFromArray(result, storage);
@@ -2823,7 +2851,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = db.slot;
+                    result[cell] = db.slot.Clone();
                     occupied[cell] = true;
                     dedicationRow = cell / ctx.width;
                     remaining.Remove(db);
@@ -2845,7 +2873,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = hg.slot;
+                    result[cell] = hg.slot.Clone();
                     occupied[cell] = true;
                     remaining.Remove(hg);
                     slotsNow = SlotsFromArray(result, storage);
@@ -2873,7 +2901,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = shard.slot;
+                    result[cell] = shard.slot.Clone();
                     occupied[cell] = true;
                     remaining.Remove(shard);
                     slotsNow = SlotsFromArray(result, storage);
@@ -2926,7 +2954,7 @@ namespace SephiriaBackpackOrganizer
                     }
                     if (target >= 0)
                     {
-                        result[target] = planet.slot;
+                        result[target] = planet.slot.Clone();
                         occupied[target] = true;
                         remaining.Remove(planet);
                         slotsNow = SlotsFromArray(result, storage);
@@ -2952,7 +2980,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (target >= 0)
                 {
-                    result[target] = compass.slot;
+                    result[target] = compass.slot.Clone();
                     occupied[target] = true;
                     remaining.Remove(compass);
                     slotsNow = SlotsFromArray(result, storage);
@@ -2963,7 +2991,12 @@ namespace SephiriaBackpackOrganizer
             // 2e) 其余护符按用户优先级（1→4），同优先级内按稀有度
             remaining.Sort((a, b) =>
             {
-                int p = a.priority.CompareTo(b.priority);
+                int p = CompareManualPriority(a, b);
+                if (p != 0)
+                {
+                    return p;
+                }
+                p = a.priority.CompareTo(b.priority);
                 if (p != 0)
                 {
                     return p;
@@ -2979,7 +3012,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = charm.slot;
+                    result[cell] = charm.slot.Clone();
                     occupied[cell] = true;
                     slotsNow = SlotsFromArray(result, storage);
                     EvaluateLayout(ctx, slotsNow);
@@ -2992,7 +3025,7 @@ namespace SephiriaBackpackOrganizer
                 int cell = FirstFree(occupied);
                 if (cell >= 0)
                 {
-                    result[cell] = other.slot;
+                    result[cell] = other.slot.Clone();
                     occupied[cell] = true;
                 }
             }
@@ -3007,7 +3040,7 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (cell >= 0)
                 {
-                    result[cell] = burden.slot;
+                    result[cell] = burden.slot.Clone();
                     occupied[cell] = true;
                 }
             }
@@ -3062,8 +3095,8 @@ namespace SephiriaBackpackOrganizer
                 }
                 if (above != null && above.hasItem && above.charm != null)
                 {
-                    bool valid = above.charm is Charm_UpCharmDamage ||
-                                 (above.charm is IAttackableCharm ac && ac.IsAttackableCharm());
+                    bool valid = ctx.itemByInstance.TryGetValue(above.instanceID, out ItemInfo pairedAboveInfo) &&
+                                 pairedAboveInfo != null && (pairedAboveInfo.isCompass || pairedAboveInfo.isAttackable);
                     if (valid)
                     {
                         // 按上方伤害藏品的优先级加权：高优先级伤害神器优先配对
@@ -3084,15 +3117,15 @@ namespace SephiriaBackpackOrganizer
             return best;
         }
 
-        private static int SteleImportance(Slot stele)
+        private static int SteleImportance(StoneTablet tablet)
         {
-            if (stele.tablet == null)
+            if (tablet == null)
             {
                 return 0;
             }
             try
             {
-                string q = stele.tablet.GetQuery(stele.tablet.instanceID);
+                string q = tablet.GetQuery(tablet.instanceID);
                 if (string.IsNullOrEmpty(q))
                 {
                     return 0;
@@ -3114,7 +3147,11 @@ namespace SephiriaBackpackOrganizer
             }
         }
 
-        private static float EvaluateStelePattern(SearchContext ctx, StelePattern pattern, Slot[] result, bool[] occupied,
+        private static float EvaluateStelePattern(
+            SearchContext ctx,
+            StelePattern pattern,
+            Slot[] result,
+            bool[] occupied,
             HashSet<int> steleEffectCells = null)
         {
             if (!ConditionsOk(pattern, SlotsFromArray(result, ctx.storage)))
@@ -3123,7 +3160,6 @@ namespace SephiriaBackpackOrganizer
             }
 
             float score = 0f;
-            // 石板自身格若落在已有加成格上：该加成被石板吃掉、护符用不上 → 重罚，贪心会避开
             if (steleEffectCells != null && pattern.cell >= 0 && steleEffectCells.Contains(pattern.cell))
             {
                 score -= 100f;
@@ -3137,11 +3173,11 @@ namespace SephiriaBackpackOrganizer
                         score += e.value * 10f;
                         if (e.value < 0 && !covered)
                         {
-                            score -= 160f; // 负效果落在空格：重罚
+                            score -= 160f;
                         }
                         else if (e.value > 0 && covered)
                         {
-                            score -= 60f; // 正值效果落在已占用格：加成浪费
+                            score -= 60f;
                         }
                         break;
                     case 2:
@@ -3226,7 +3262,7 @@ namespace SephiriaBackpackOrganizer
                     }
                 }
                 bool isIgnore = ctx.ignore[cell];
-                bool natural = IsSatisfyingCell(ctx.inv, charm.kind, x, y, cell, ctx.storage, ctx.width);
+                bool natural = IsSatisfyingCell(charm.kind, x, y, cell, ctx.storage, ctx.width);
                 int level = ctx.cellLevel[cell];
                 // 和谐之晶邻域：高等级护符优先聚到它周围8格
                 float sc = level * 100f * ctx.mysticFactor[cell] - (ctx.disabled[cell] ? 500f : 0f);
@@ -3677,6 +3713,7 @@ namespace SephiriaBackpackOrganizer
             }
 
             busy = true;
+            bool backgroundStarted = false;
             try
             {
                 if (plugin.SelfTest.Value && NetworkServer.active)
@@ -3692,9 +3729,8 @@ namespace SephiriaBackpackOrganizer
                         break;
 
                     case SortMode.Enhanced:
-                        // 异步整理：计算（多帧退火）+ 应用（每帧少量 Swap）分帧执行，
-                        // 消除主线程长阻塞与一次性同步风暴（联机卡顿的关键优化）
-                        TryStartAsyncSort(inv);
+                        // 主机与联机客户端都在后台做纯数据搜索，再由主线程分帧执行游戏操作。
+                        backgroundStarted = StartSortEnhanced(inv);
                         break;
 
                     default:
@@ -3707,57 +3743,75 @@ namespace SephiriaBackpackOrganizer
             {
                 Plugin.Log.LogError($"整理背包异常: {ex}");
                 Notify("整理背包失败，详见日志。");
-                pendingSort = null;
             }
             finally
             {
-                // 异步任务进行中（pendingSort 非空）保持 busy=true，防止重复触发覆盖任务
-                if (pendingSort == null)
+                if (!backgroundStarted)
                 {
                     busy = false;
                 }
             }
         }
 
-        /// <summary>启动异步增强整理：同步准备快照/上下文/智能初始（几十 ms），
-        /// 退火计算与应用 Swap 由 AdvancePendingSort 每帧分片推进（消除主线程长阻塞与同步风暴）。</summary>
-        private void TryStartAsyncSort(GridInventory inv)
+        private static int CompareManualPriority(ItemInfo a, ItemInfo b)
         {
-            List<Slot> original = CaptureState(inv);
-            if (!VerifyInventorySnapshot(inv, original))
+            int ar = a != null ? a.manualPriorityRank : 0;
+            int br = b != null ? b.manualPriorityRank : 0;
+            if (ar == br)
             {
-                Notify("背包状态未就绪，本次未整理（请稍后再试）。");
-                busy = false;
+                return 0;
+            }
+            if (ar == 0)
+            {
+                return 1;
+            }
+            if (br == 0)
+            {
+                return -1;
+            }
+            return ar.CompareTo(br);
+        }
+
+        /// <summary>由 Plugin.Update 在 Unity 主线程轮询后台搜索完成状态。</summary>
+        public void Poll()
+        {
+            if (pendingEnhanced == null)
+            {
                 return;
             }
-            SearchContext ctx = BuildContext(inv, original);
-            LogItemIdentification(ctx);
 
-            var job = new SortJobState
+            PendingEnhancedSort state = pendingEnhanced;
+            try
             {
-                inv = inv,
-                original = original,
-                ctx = ctx,
-                beforeScore = EvaluateLayout(ctx, original),
-                globalBest = EvaluateLayout(ctx, original),
-                bestLayout = original,
-                isClient = !NetworkServer.active,
-                computingDone = false
-            };
-            if (plugin.EnableSmartStart.Value)
-            {
-                job.smartStart = BuildSmartStart(ctx);
-                double smartScore = EvaluateLayout(ctx, job.smartStart);
-                Plugin.Log.LogInfo($"智能初始布局：评分 {job.beforeScore:F0} -> {smartScore:F0}");
-            }
-            else
-            {
-                job.smartStart = original;
-            }
+                if (!NetworkClient.active || state.inv == null)
+                {
+                    CancelEnhancedSort(state, "游戏会话已结束，本次整理已取消。", false);
+                    return;
+                }
 
-            pendingSort = job;
-            job.clock.Start();
-            Notify("整理中…");
+                if (pendingSearch != null)
+                {
+                    if (!pendingSearch.IsCompleted)
+                    {
+                        return;
+                    }
+
+                    Task<SearchOutcome> completed = pendingSearch;
+                    pendingSearch = null;
+                    BeginApplyEnhanced(state, completed.GetAwaiter().GetResult());
+                    return;
+                }
+
+                if (state.applying)
+                {
+                    AdvanceApplyEnhanced(state);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"后台整理搜索异常: {ex}");
+                CancelEnhancedSort(state, "整理背包失败，详见日志。", true);
+            }
         }
 
         // ---------------------------------------------------------------- Vanilla
@@ -3800,7 +3854,7 @@ namespace SephiriaBackpackOrganizer
         // ---------------------------------------------------------------- Enhanced
 
         /// <summary>离线计算最优布局（智能初始 + 多轮独立多起点退火，取全局最优），不修改游戏状态。</summary>
-        private List<Slot> ComputeBestLayout(GridInventory inv, List<Slot> original, SearchContext ctx,
+        private List<Slot> ComputeBestLayout(List<Slot> original, SearchContext ctx,
             out double beforeScore, out double bestScore)
         {
             beforeScore = EvaluateLayout(ctx, original);
@@ -3820,19 +3874,31 @@ namespace SephiriaBackpackOrganizer
 
             // 多轮独立搜索（不同随机种子），取全局最优——等效于自动重复按 F8 多次
             int rounds = Math.Max(1, plugin.SearchRounds.Value);
+            long deadlineTicks = CreateSearchDeadline(plugin.SearchTimeBudgetMs.Value);
             List<Slot> bestLayout = original;
             double globalBest = beforeScore;
             for (int round = 0; round < rounds; round++)
             {
+                if (SearchDeadlineReached(deadlineTicks))
+                {
+                    ctx.searchBudgetReached = true;
+                    break;
+                }
                 var rng = new System.Random(Environment.TickCount + round * 7919);
                 var result = AnnealMultiStart(ctx, start, original, rng,
                     plugin.EnhancedIterations.Value, plugin.EnhancedRestarts.Value,
-                    plugin.EnhancedTemperature.Value);
+                    plugin.EnhancedTemperature.Value, deadlineTicks);
                 if (result.Score > globalBest)
                 {
                     globalBest = result.Score;
                     bestLayout = result.Best;
                 }
+            }
+
+            if (ctx.searchBudgetReached || SearchDeadlineReached(deadlineTicks))
+            {
+                ctx.searchBudgetReached = true;
+                Plugin.Log.LogInfo($"搜索达到 {plugin.SearchTimeBudgetMs.Value}ms 时间预算，已保留当前最优布局。");
             }
 
             if (!CompassBindingsSatisfied(ctx, bestLayout))
@@ -3846,7 +3912,7 @@ namespace SephiriaBackpackOrganizer
             return globalBest >= beforeScore - 0.5 ? bestLayout : original;
         }
 
-        private void SortEnhanced(GridInventory inv)
+        private bool StartSortEnhanced(GridInventory inv)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -3854,71 +3920,238 @@ namespace SephiriaBackpackOrganizer
             if (!VerifyInventorySnapshot(inv, original))
             {
                 Notify("背包状态未就绪，本次未整理（请稍后再试）。");
-                return;
+                return false;
             }
             SearchContext ctx = BuildContext(inv, original);
-            LogItemIdentification(ctx);
+            if (plugin.VerboseDiagnostics.Value)
+            {
+                LogItemIdentification(ctx);
+            }
 
-            List<Slot> finalLayout = ComputeBestLayout(inv, original, ctx, out double beforeScore, out double bestScore);
+            float beforeGame = SafeScore(inv);
+            pendingEnhanced = new PendingEnhancedSort
+            {
+                inv = inv,
+                original = original,
+                ctx = ctx,
+                beforeGameScore = beforeGame,
+                stopwatch = sw,
+                swapsPerFrame = Math.Max(1, plugin.ApplySwapsPerFrame.Value),
+                rotationClicksPerFrame = Math.Max(1, plugin.ApplyRotationClicksPerFrame.Value),
+                frameBudgetMs = Math.Max(0.25, plugin.ApplyFrameBudgetMs.Value),
+                acknowledgementTimeoutMs = Math.Max(250, plugin.ApplyAckTimeoutMs.Value)
+            };
+            pendingSearch = Task.Run(() =>
+            {
+                List<Slot> layout = ComputeBestLayout(original, ctx,
+                    out double beforeScore, out double bestScore);
+                return new SearchOutcome
+                {
+                    layout = layout,
+                    beforeScore = beforeScore,
+                    bestScore = bestScore
+                };
+            });
+            // 按下 F8 后立即给出简短反馈；完成时再统一显示原版风格的“整理完毕”。
+            // 评分、回滚等内部诊断信息仍只写入日志。
+            Notify("整理中…");
+            return true;
+        }
 
-            // 应用：与联机客户端一致——用交换/旋转"挪移"物品，不清空背包、不改写字典，
-            // 从机制上杜绝"清空重写导致物品丢失"的风险（主机/单机同样安全）
-            ApplyByMoves(inv, original, finalLayout);
-            float finalGameScore = SafeScore(inv);
-            double finalOffline = EvaluateLayout(ctx, finalLayout);
-            float beforeGame = SafeScoreBefore(inv, original);
+        private void BeginApplyEnhanced(PendingEnhancedSort state, SearchOutcome outcome)
+        {
+            if (state == null || outcome == null || state.inv == null)
+            {
+                throw new InvalidOperationException("后台整理状态丢失");
+            }
 
-            LogLayoutGrid(ctx, finalLayout, "整理");
-            LogLayoutAnalysis(ctx, finalLayout, "整理");
+            GridInventory inv = state.inv;
+            List<Slot> original = state.original;
 
-            sw.Stop();
+            // 搜索期间游戏继续运行；背包只要发生过位置、旋转或物品集合变化，就丢弃旧结果。
+            List<Slot> currentLayout = CaptureState(inv);
+            if (!VerifyInventorySnapshot(inv, original) ||
+                !LayoutsEquivalent(currentLayout, original))
+            {
+                CancelEnhancedSort(state,
+                    $"后台搜索完成（{state.stopwatch.ElapsedMilliseconds}ms），但背包期间已变化，结果已丢弃。",
+                    false);
+                return;
+            }
+
+            state.outcome = outcome;
+            state.target = CloneSlots(outcome.layout);
+            BeginMovePlan(state, original, state.target, false);
+        }
+
+        private void BeginMovePlan(PendingEnhancedSort state, List<Slot> current,
+            List<Slot> target, bool rollingBack)
+        {
+            state.swaps.Clear();
+            state.rotations.Clear();
+            BuildClientOps(current, target, state.swaps, state.rotations);
+            state.expected = CloneSlots(current);
+            state.target = CloneSlots(target);
+            state.swapIndex = 0;
+            state.rotationIndex = 0;
+            state.rotationRemaining = 0;
+            state.rollingBack = rollingBack;
+            state.applying = true;
+            state.awaitingObservedState = false;
+            state.acknowledgement.Reset();
+
+            if (state.swaps.Count == 0 && state.rotations.Count == 0)
+            {
+                CompleteApplyEnhanced(state);
+            }
+        }
+
+        private void AdvanceApplyEnhanced(PendingEnhancedSort state)
+        {
+            if (state.awaitingObservedState)
+            {
+                List<Slot> observed = CaptureState(state.inv);
+                if (!LayoutsEquivalent(observed, state.expected))
+                {
+                    if (!state.acknowledgement.IsRunning)
+                    {
+                        state.acknowledgement.Restart();
+                    }
+                    if (state.acknowledgement.ElapsedMilliseconds < state.acknowledgementTimeoutMs)
+                    {
+                        return;
+                    }
+
+                    string phase = state.rollingBack ? "回滚" : "应用";
+                    CancelEnhancedSort(state,
+                        $"整理{phase}等待服务器确认超时，已停止继续操作。当前背包未被强制改写。", true);
+                    return;
+                }
+
+                state.awaitingObservedState = false;
+                state.acknowledgement.Reset();
+            }
+
+            var frame = System.Diagnostics.Stopwatch.StartNew();
+            int swapsThisFrame = 0;
+            int rotationsThisFrame = 0;
+            bool didWork = false;
+
+            while (state.swapIndex < state.swaps.Count &&
+                   swapsThisFrame < state.swapsPerFrame &&
+                   (swapsThisFrame == 0 || frame.Elapsed.TotalMilliseconds < state.frameBudgetMs))
+            {
+                var op = state.swaps[state.swapIndex++];
+                ItemPosition a = state.inv.IdxToPos(op.a);
+                ItemPosition b = state.inv.IdxToPos(op.b);
+                state.inv.Swap(a.x, a.y, b.x, b.y);
+                SwapSlots(state.expected, op.a, op.b);
+                swapsThisFrame++;
+                didWork = true;
+            }
+
+            // 所有交换完成后才开始旋转。rotationRemaining 跨帧保留，避免漏掉一次点击。
+            while (state.swapIndex >= state.swaps.Count &&
+                   state.rotationIndex < state.rotations.Count &&
+                   rotationsThisFrame < state.rotationClicksPerFrame &&
+                   ((swapsThisFrame == 0 && rotationsThisFrame == 0) ||
+                    frame.Elapsed.TotalMilliseconds < state.frameBudgetMs))
+            {
+                var op = state.rotations[state.rotationIndex];
+                if (state.rotationRemaining <= 0)
+                {
+                    state.rotationRemaining = op.count;
+                }
+
+                ItemPosition p = state.inv.IdxToPos(op.pos);
+                state.inv.DoClickAction(p);
+                Slot slot = state.expected[op.pos];
+                slot.rotation = (slot.rotation + 1) % 4;
+                state.expected[op.pos] = slot;
+                state.rotationRemaining--;
+                rotationsThisFrame++;
+                didWork = true;
+
+                if (state.rotationRemaining == 0)
+                {
+                    state.rotationIndex++;
+                }
+            }
+
+            if (didWork)
+            {
+                state.awaitingObservedState = true;
+                return;
+            }
+
+            if (state.swapIndex >= state.swaps.Count &&
+                state.rotationIndex >= state.rotations.Count &&
+                state.rotationRemaining == 0)
+            {
+                CompleteApplyEnhanced(state);
+            }
+        }
+
+        private void CompleteApplyEnhanced(PendingEnhancedSort state)
+        {
+            List<Slot> actual = CaptureState(state.inv);
+            if (!LayoutsEquivalent(actual, state.target))
+            {
+                if (!state.rollingBack && VerifyInventorySnapshot(state.inv, state.original))
+                {
+                    Plugin.Log.LogWarning("应用后的物品/旋转布局与搜索目标不一致，正在分帧恢复整理前布局。");
+                    BeginMovePlan(state, actual, state.original, true);
+                }
+                else
+                {
+                    Plugin.Log.LogError("整理回滚后布局仍与整理前快照不一致，请保留日志并检查背包。");
+                    CancelEnhancedSort(state, "整理未能安全完成，请检查背包。", true);
+                }
+                return;
+            }
+
+            float finalGameScore = SafeScore(state.inv);
+            bool gameScoreWorse = !float.IsNaN(state.beforeGameScore) && !float.IsNaN(finalGameScore) &&
+                                  finalGameScore < state.beforeGameScore - 0.5f;
+            if (!state.rollingBack && gameScoreWorse)
+            {
+                Plugin.Log.LogWarning($"整理结果游戏评分下降 {state.beforeGameScore:F0} -> {finalGameScore:F0}，正在分帧回滚。");
+                BeginMovePlan(state, actual, state.original, true);
+                return;
+            }
+
+            double finalOffline = EvaluateLayout(state.ctx, actual);
+            if (plugin.VerboseDiagnostics.Value)
+            {
+                LogLayoutGrid(state.ctx, actual, state.rollingBack ? "回滚" : "整理");
+                LogLayoutAnalysis(state.ctx, actual, state.rollingBack ? "回滚" : "整理");
+            }
+
+            state.stopwatch.Stop();
             Plugin.Log.LogInfo(
-                $"增强整理完成（{sw.ElapsedMilliseconds}ms）：离线评分 {beforeScore:F0} -> {finalOffline:F0}" +
-                $"（搜索最优 {bestScore:F0}）；游戏评分 {beforeGame:F0} -> {finalGameScore:F0}" +
-                $"；布局 {ctx.items.Count} 件（石板{ctx.steles.Count} 护符{ctx.charms.Count}" +
-                $" 负担{ctx.burdens.Count} 其他{ctx.others.Count}）");
+                $"增强整理完成（后台+分帧总耗时 {state.stopwatch.ElapsedMilliseconds}ms）：" +
+                $"离线评分 {state.outcome.beforeScore:F0} -> {finalOffline:F0}（搜索最优 {state.outcome.bestScore:F0}）；" +
+                $"游戏评分 {state.beforeGameScore:F0} -> {finalGameScore:F0}；" +
+                $"搜索 {state.ctx.annealEvaluations} 候选/启动 {state.ctx.annealStartsCompleted}/{state.ctx.annealStarts}" +
+                $"；{(state.rollingBack ? "已安全回滚" : "落地校验一致")}；布局 {state.ctx.items.Count} 件");
+            state.applying = false;
+            pendingEnhanced = null;
+            pendingSearch = null;
+            busy = false;
             Notify("整理完毕");
         }
 
-        /// <summary>联机客户端智能整理：本地离线算最优布局，再用游戏自带网络接口（Swap 交换 / DoClickAction 旋转）逐步调整。
-        /// 无需服务器权限，主机/客户端均可用；不清空背包，比主机版更安全。</summary>
-        private void SortClient(GridInventory inv)
+        private void CancelEnhancedSort(PendingEnhancedSort state, string reason, bool notifyFailure)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-
-            List<Slot> original = CaptureState(inv);
-            if (!VerifyInventorySnapshot(inv, original))
+            if (state != null && state.stopwatch != null && state.stopwatch.IsRunning)
             {
-                Notify("背包状态未就绪，本次未整理（请稍后再试）。");
-                return;
+                state.stopwatch.Stop();
             }
-            SearchContext ctx = BuildContext(inv, original);
-            LogItemIdentification(ctx);
-
-            List<Slot> finalLayout = ComputeBestLayout(inv, original, ctx, out double beforeScore, out double bestScore);
-
-            // 生成操作序列（逻辑推演：物品位置与旋转随交换更新）
-            var swaps = new List<(int a, int b)>();
-            var rots = new List<(int pos, int count)>();
-            BuildClientOps(inv, original, finalLayout, swaps, rots);
-
-            if (swaps.Count == 0 && rots.Count == 0)
-            {
-                sw.Stop();
-                Plugin.Log.LogInfo($"联机整理：布局已最优，无需调整（{sw.ElapsedMilliseconds}ms）。");
-                Notify("整理完毕");
-                return;
-            }
-
-            // 执行：先交换位置，再旋转石板（不清空背包）
-            ApplyMoves(inv, swaps, rots);
-
-            sw.Stop();
-            Plugin.Log.LogInfo(
-                $"联机客户端整理完成（{sw.ElapsedMilliseconds}ms 计算，{swaps.Count} 次交换/{rots.Count} 处旋转）：" +
-                $"离线评分 {beforeScore:F0} -> {bestScore:F0}；布局 {ctx.items.Count} 件" +
-                $"（石板{ctx.steles.Count} 护符{ctx.charms.Count} 负担{ctx.burdens.Count}）");
-            Notify("整理完毕");
+            Plugin.Log.LogWarning(reason);
+            pendingSearch = null;
+            pendingEnhanced = null;
+            busy = false;
+            Notify(notifyFailure ? reason : "整理期间背包发生变化，本次结果已取消");
         }
 
         /// <summary>执行交换/旋转操作序列（主机与联机客户端通用）。</summary>
@@ -3945,12 +4178,12 @@ namespace SephiriaBackpackOrganizer
         {
             var swaps = new List<(int a, int b)>();
             var rots = new List<(int pos, int count)>();
-            BuildClientOps(inv, original, finalLayout, swaps, rots);
+            BuildClientOps(original, finalLayout, swaps, rots);
             ApplyMoves(inv, swaps, rots);
         }
 
         /// <summary>把"当前布局→目标布局"转换为 交换(位置) + 旋转(位置×次数) 操作序列（逻辑推演，含位置与旋转追踪）。</summary>
-        private static void BuildClientOps(GridInventory inv, List<Slot> current, List<Slot> target,
+        private static void BuildClientOps(List<Slot> current, List<Slot> target,
             List<(int, int)> swaps, List<(int, int)> rots)
         {
             int n = Math.Min(current.Count, target.Count);
@@ -4037,12 +4270,6 @@ namespace SephiriaBackpackOrganizer
             }
         }
 
-        private float SafeScoreBefore(GridInventory inv, List<Slot> original)
-        {
-            // 读取整理前的真实游戏评分（不改变布局）
-            return SafeScore(inv);
-        }
-
         private struct AnnealResult
         {
             public List<Slot> Best;
@@ -4051,8 +4278,9 @@ namespace SephiriaBackpackOrganizer
 
         /// <summary>全离线模拟退火：交换 / 移动 / 旋转 / 定向移动（条件、行星、罗盘、负担）。</summary>
         private AnnealResult Anneal(SearchContext ctx, List<Slot> start, System.Random rng,
-            int iterations, int restarts, float temp0)
+            int iterations, int restarts, float temp0, long deadlineTicks = 0)
         {
+            ctx.annealStarts++;
             var best = CloneSlots(start);
             if (!RestoreCompassBindings(ctx, best))
             {
@@ -4061,13 +4289,20 @@ namespace SephiriaBackpackOrganizer
             double bestScore = EvaluateLayout(ctx, best);
 
             var candidate = CloneSlots(best);
+            var mutated = CloneSlots(best);
             double candidateScore = bestScore;
 
             for (int r = 0; r < restarts; r++)
             {
                 for (int i = 0; i < iterations; i++)
                 {
-                    var mutated = CloneSlots(candidate);
+                    if ((i & 31) == 0 && SearchDeadlineReached(deadlineTicks))
+                    {
+                        ctx.searchBudgetReached = true;
+                        return new AnnealResult { Best = best, Score = bestScore };
+                    }
+
+                    CopySlots(candidate, mutated);
                     Mutate(ctx, mutated, rng);
                     if (!RestoreCompassBindings(ctx, mutated))
                     {
@@ -4075,10 +4310,11 @@ namespace SephiriaBackpackOrganizer
                     }
 
                     double s = EvaluateLayout(ctx, mutated);
+                    ctx.annealEvaluations++;
 
                     if (s > bestScore)
                     {
-                        best = CloneSlots(mutated);
+                        CopySlots(mutated, best);
                         bestScore = s;
                     }
 
@@ -4087,264 +4323,24 @@ namespace SephiriaBackpackOrganizer
                                   rng.NextDouble() < Math.Exp((s - candidateScore) / t);
                     if (accept)
                     {
+                        List<Slot> oldCandidate = candidate;
                         candidate = mutated;
+                        mutated = oldCandidate;
                         candidateScore = s;
                     }
                 }
 
                 candidateScore = EvaluateLayout(ctx, best);
-                candidate = CloneSlots(best);
+                CopySlots(best, candidate);
             }
 
+            ctx.annealStartsCompleted++;
             return new AnnealResult { Best = best, Score = bestScore };
-        }
-
-        /// <summary>步进式退火：每次调用最多执行 budget 次迭代，返回是否完成（供分帧任务使用）。
-        /// 语义与 Anneal 完全一致：历史最优 best 只升不降，candidate 允许变差漂移，重启回到 best。</summary>
-        private bool AnnealAdvance(SearchContext ctx, AnnealState st, int budget)
-        {
-            int done = 0;
-            while (done < budget)
-            {
-                if (st.restart >= st.restarts)
-                {
-                    return true;
-                }
-                if (st.iter >= st.iterations)
-                {
-                    // 重启：回到当前最优
-                    st.candidate = CloneSlots(st.best);
-                    st.candidateScore = EvaluateLayout(ctx, st.best);
-                    st.restart++;
-                    st.iter = 0;
-                    if (st.restart >= st.restarts)
-                    {
-                        return true;
-                    }
-                }
-
-                var mutated = CloneSlots(st.candidate);
-                Mutate(ctx, mutated, st.rng);
-                if (!RestoreCompassBindings(ctx, mutated))
-                {
-                    st.iter++;
-                    done++;
-                    continue;
-                }
-                double s = EvaluateLayout(ctx, mutated);
-                if (s > st.bestScore)
-                {
-                    st.best = CloneSlots(mutated);
-                    st.bestScore = s;
-                }
-                double t = Math.Max(1f, st.temp0 * (1f - (double)st.iter / Math.Max(1, st.iterations)));
-                bool accept = s >= st.candidateScore ||
-                              st.rng.NextDouble() < Math.Exp((s - st.candidateScore) / t);
-                if (accept)
-                {
-                    st.candidate = mutated;
-                    st.candidateScore = s;
-                }
-                st.iter++;
-                done++;
-            }
-            return false;
-        }
-
-        /// <summary>构建多起点列表（智能初始 / 原始 / 随机×2），随机部分用传入 rng。</summary>
-        private List<List<Slot>> BuildStarts(SearchContext ctx, List<Slot> smartStart, List<Slot> original, System.Random rng)
-        {
-            var starts = new List<List<Slot>> { smartStart };
-            if (plugin.EnableRandomStarts.Value)
-            {
-                starts.Add(original);
-                var r1 = CloneSlots(original);
-                Scramble(r1, rng);
-                starts.Add(r1);
-                var r2 = CloneSlots(original);
-                Scramble(r2, rng);
-                starts.Add(r2);
-            }
-            return starts;
-        }
-
-        /// <summary>每帧驱动异步整理任务（由 Plugin.Tick 调用）：先分帧退火计算，再分帧执行 Swap/旋转。</summary>
-        public void AdvancePendingSort()
-        {
-            var j = pendingSort;
-            if (j == null)
-            {
-                return;
-            }
-            if (!NetworkClient.active)
-            {
-                CancelPendingSort("会话已退出，取消本次整理");
-                return;
-            }
-            if (!j.computingDone)
-            {
-                AdvanceCompute(j);
-            }
-            else
-            {
-                AdvanceApply(j);
-            }
-        }
-
-        private void AdvanceCompute(SortJobState j)
-        {
-            int rounds = Math.Max(1, plugin.SearchRounds.Value);
-            if (j.round >= rounds)
-            {
-                FinishCompute(j);
-                return;
-            }
-
-            if (j.anneal == null)
-            {
-                if (j.starts == null || j.startIdx >= j.starts.Count)
-                {
-                    // 本轮起点用完 → 进入下一轮（新随机种子重建起点列表）
-                    j.round++;
-                    if (j.round >= rounds)
-                    {
-                        FinishCompute(j);
-                        return;
-                    }
-                    var rng = new System.Random(Environment.TickCount + j.round * 7919);
-                    j.starts = BuildStarts(j.ctx, j.smartStart, j.original, rng);
-                    j.startIdx = 0;
-                }
-                var start = j.starts[j.startIdx++];
-                j.anneal = new AnnealState
-                {
-                    rng = new System.Random(Environment.TickCount + j.round * 7919 + j.startIdx * 131),
-                    iterations = plugin.EnhancedIterations.Value,
-                    restarts = plugin.EnhancedRestarts.Value,
-                    temp0 = plugin.EnhancedTemperature.Value
-                };
-                j.anneal.best = CloneSlots(start);
-                if (!RestoreCompassBindings(j.ctx, j.anneal.best))
-                {
-                    j.anneal.best = CloneSlots(j.ctx.original);
-                }
-                j.anneal.bestScore = EvaluateLayout(j.ctx, j.anneal.best);
-                j.anneal.candidate = CloneSlots(j.anneal.best);
-                j.anneal.candidateScore = j.anneal.bestScore;
-            }
-
-            bool finished = AnnealAdvance(j.ctx, j.anneal, ComputeIterationsPerFrame);
-            if (finished)
-            {
-                if (j.anneal.bestScore > j.globalBest)
-                {
-                    j.globalBest = j.anneal.bestScore;
-                    j.bestLayout = CloneSlots(j.anneal.best);
-                }
-                j.anneal = null;
-            }
-        }
-
-        /// <summary>每帧退火迭代预算（约 3ms，量级 1µs/迭代）。</summary>
-        private int ComputeIterationsPerFrame => 3000;
-
-        private void FinishCompute(SortJobState j)
-        {
-            j.computingDone = true;
-
-            if (!CompassBindingsSatisfied(j.ctx, j.bestLayout))
-            {
-                Plugin.Log.LogWarning("搜索结果破坏了整理前的指北针目标绑定，已回退整理前布局。");
-                j.bestLayout = CloneSlots(j.original);
-                j.globalBest = j.beforeScore;
-            }
-
-            List<Slot> final = j.globalBest >= j.beforeScore - 0.5 ? j.bestLayout : j.original;
-            j.swaps = new List<(int a, int b)>();
-            j.rots = new List<(int pos, int count)>();
-            BuildClientOps(j.inv, j.original, final, j.swaps, j.rots);
-            j.applyIdx = 0;
-            j.rotIdx = 0;
-
-            if (j.swaps.Count == 0 && j.rots.Count == 0)
-            {
-                FinishSort(j);
-                return;
-            }
-            // 交换/旋转数量只写日志（诊断用），玩家界面仅显示"整理中…"与"整理完毕"
-            Plugin.Log.LogInfo($"整理调整：{j.swaps.Count} 次交换 / {j.rots.Count} 处旋转");
-        }
-
-        private void AdvanceApply(SortJobState j)
-        {
-            // 交换：每帧最多 2 次（分摊同步风暴）
-            int swapBudget = 2;
-            while (swapBudget > 0 && j.applyIdx < j.swaps.Count)
-            {
-                var (a, b) = j.swaps[j.applyIdx++];
-                ItemPosition pa = j.inv.IdxToPos(a);
-                ItemPosition pb = j.inv.IdxToPos(b);
-                j.inv.Swap(pa.x, pa.y, pb.x, pb.y);
-                swapBudget--;
-            }
-            if (j.applyIdx < j.swaps.Count)
-            {
-                return; // 交换未完，等下一帧
-            }
-
-            // 旋转：每帧最多 4 次点击
-            int rotBudget = 4;
-            while (rotBudget > 0 && j.rotIdx < j.rots.Count)
-            {
-                var (pos, count) = j.rots[j.rotIdx];
-                ItemPosition p = j.inv.IdxToPos(pos);
-                for (int r = 0; r < count && rotBudget > 0; r++)
-                {
-                    j.inv.DoClickAction(p);
-                    rotBudget--;
-                }
-                j.rotIdx++;
-            }
-            if (j.rotIdx < j.rots.Count)
-            {
-                return;
-            }
-
-            FinishSort(j);
-        }
-
-        private void FinishSort(SortJobState j)
-        {
-            j.clock.Stop();
-            float finalGameScore = SafeScore(j.inv);
-            double finalOffline = EvaluateLayout(j.ctx, j.bestLayout);
-            float beforeGame = SafeScoreBefore(j.inv, j.original);
-
-            LogLayoutGrid(j.ctx, j.bestLayout, "整理");
-            LogLayoutAnalysis(j.ctx, j.bestLayout, "整理");
-
-            string modeTag = j.isClient ? "联机客户端整理完成" : "增强整理完成";
-            Plugin.Log.LogInfo(
-                $"{modeTag}（{j.clock.ElapsedMilliseconds}ms）：离线评分 {j.beforeScore:F0} -> {finalOffline:F0}" +
-                $"（搜索最优 {j.globalBest:F0}）；游戏评分 {beforeGame:F0} -> {finalGameScore:F0}" +
-                $"；布局 {j.ctx.items.Count} 件（石板{j.ctx.steles.Count} 护符{j.ctx.charms.Count}" +
-                $" 负担{j.ctx.burdens.Count} 其他{j.ctx.others.Count}）" +
-                (j.isClient ? $"; 交换 {j.swaps.Count} 次/旋转 {j.rots.Count} 处" : ""));
-            Notify("整理完毕");
-            busy = false;
-            pendingSort = null;
-        }
-
-        private void CancelPendingSort(string reason)
-        {
-            Plugin.Log.LogWarning(reason);
-            busy = false;
-            pendingSort = null;
         }
 
         /// <summary>多起点退火：智能初始 / 原始布局 / 随机布局各跑一轮，取全局最优（离线评估极快，开销可忽略）。</summary>
         private AnnealResult AnnealMultiStart(SearchContext ctx, List<Slot> smartStart, List<Slot> original,
-            System.Random rng, int iterations, int restarts, float temp0)
+            System.Random rng, int iterations, int restarts, float temp0, long deadlineTicks = 0)
         {
             var globalBest = CloneSlots(original);
             double globalScore = EvaluateLayout(ctx, globalBest);
@@ -4354,16 +4350,21 @@ namespace SephiriaBackpackOrganizer
             {
                 starts.Add(original);
                 var r1 = CloneSlots(original);
-                Scramble(r1, rng);
+                ScrambleForSearch(ctx, r1, rng);
                 starts.Add(r1);
                 var r2 = CloneSlots(original);
-                Scramble(r2, rng);
+                ScrambleForSearch(ctx, r2, rng);
                 starts.Add(r2);
             }
 
             foreach (List<Slot> start in starts)
             {
-                var res = Anneal(ctx, start, rng, iterations, restarts, temp0);
+                if (SearchDeadlineReached(deadlineTicks))
+                {
+                    ctx.searchBudgetReached = true;
+                    break;
+                }
+                var res = Anneal(ctx, start, rng, iterations, restarts, temp0, deadlineTicks);
                 if (res.Score > globalScore)
                 {
                     globalScore = res.Score;
@@ -4378,28 +4379,36 @@ namespace SephiriaBackpackOrganizer
 
         private void Mutate(SearchContext ctx, List<Slot> slots, System.Random rng)
         {
-            var itemIdx = new List<int>();
-            var emptyIdx = new List<int>();
+            int[] itemIdx = ctx.itemIndexScratch;
+            int[] emptyIdx = ctx.emptyIndexScratch;
+            int itemCount = 0;
+            int emptyCount = 0;
             for (int i = 0; i < slots.Count; i++)
             {
                 if (slots[i].hasItem)
                 {
-                    itemIdx.Add(i);
+                    itemIdx[itemCount++] = i;
                 }
                 else
                 {
-                    emptyIdx.Add(i);
+                    emptyIdx[emptyCount++] = i;
                 }
             }
 
-            if (itemIdx.Count == 0)
+            if (itemCount == 0)
             {
                 return;
             }
 
+            // 手动提权使用额外的一次定向尝试，不挤占原有邻域操作概率；未提权时算法分布完全不变。
+            if (ctx.manualPriorityCount > 0 && rng.Next(100) < 16)
+            {
+                if (TryManualPriorityMove(ctx, slots, rng)) return;
+            }
+
             int roll = rng.Next(100);
 
-            // 定向移动族（合计约 52%）
+            // 原有定向移动族
             if (roll < 12 && plugin.CriteriaMoveChance.Value > 0f)
             {
                 if (TryCriteriaMove(ctx, slots, rng)) return;
@@ -4430,20 +4439,20 @@ namespace SephiriaBackpackOrganizer
             }
 
             // 随机移动/交换/旋转
-            if (roll < 75 && emptyIdx.Count > 0)
+            if (roll < 75 && emptyCount > 0)
             {
-                int a = itemIdx[rng.Next(itemIdx.Count)];
-                int b = emptyIdx[rng.Next(emptyIdx.Count)];
+                int a = itemIdx[rng.Next(itemCount)];
+                int b = emptyIdx[rng.Next(emptyCount)];
                 SwapSlots(slots, a, b);
                 return;
             }
 
             if (roll < 92)
             {
-                if (itemIdx.Count >= 2)
+                if (itemCount >= 2)
                 {
-                    int a = itemIdx[rng.Next(itemIdx.Count)];
-                    int b = itemIdx[rng.Next(itemIdx.Count)];
+                    int a = itemIdx[rng.Next(itemCount)];
+                    int b = itemIdx[rng.Next(itemCount)];
                     if (a != b) SwapSlots(slots, a, b);
                 }
                 return;
@@ -4451,30 +4460,121 @@ namespace SephiriaBackpackOrganizer
 
             for (int tries = 0; tries < 8; tries++)
             {
-                int a = itemIdx[rng.Next(itemIdx.Count)];
+                int a = itemIdx[rng.Next(itemCount)];
                 Slot slot = slots[a];
                 if (slot.tablet != null &&
-                    DungeonManager.IsTabletRotatable(slot.tablet.instanceID, slot.tablet.isRotatable))
+                    ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo tabletInfo) &&
+                    tabletInfo != null && tabletInfo.tabletRotatable)
                 {
                     slot.rotation = (slot.rotation + 1 + rng.Next(3)) % 4;
                     return;
                 }
             }
 
-            if (itemIdx.Count >= 2)
+            if (itemCount >= 2)
             {
-                int a = itemIdx[rng.Next(itemIdx.Count)];
-                int b = itemIdx[rng.Next(itemIdx.Count)];
+                int a = itemIdx[rng.Next(itemCount)];
+                int b = itemIdx[rng.Next(itemCount)];
                 if (a != b) SwapSlots(slots, a, b);
             }
         }
 
-        private bool TryCriteriaMove(SearchContext ctx, List<Slot> slots, System.Random rng)
+        private bool TryManualPriorityMove(SearchContext ctx, List<Slot> slots, System.Random rng)
         {
-            var candidates = new List<int>();
+            List<int> selected = ctx.moveScratchA;
+            selected.Clear();
+            int totalWeight = 0;
             for (int i = 0; i < slots.Count; i++)
             {
-                if (slots[i].hasItem && slots[i].charm != null && KindPriority(GetPositionKind(slots[i].charm)) >= 2)
+                Slot slot = slots[i];
+                if (slot == null || !slot.hasItem || slot.charm == null ||
+                    !ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo item) ||
+                    item == null || item.manualPriorityRank <= 0)
+                {
+                    continue;
+                }
+                selected.Add(i);
+                totalWeight += Math.Max(1, 64 / (item.manualPriorityRank * item.manualPriorityRank));
+            }
+            if (selected.Count == 0)
+            {
+                return false;
+            }
+
+            int ticket = rng.Next(Math.Max(1, totalWeight));
+            int from = selected[0];
+            ItemInfo fromInfo = null;
+            foreach (int cell in selected)
+            {
+                ItemInfo candidate = ctx.itemByInstance[slots[cell].instanceID];
+                ticket -= Math.Max(1, 64 / (candidate.manualPriorityRank * candidate.manualPriorityRank));
+                if (ticket < 0)
+                {
+                    from = cell;
+                    fromInfo = candidate;
+                    break;
+                }
+            }
+            if (fromInfo == null)
+            {
+                fromInfo = ctx.itemByInstance[slots[from].instanceID];
+            }
+
+            int currentLevel = ctx.disabled[from]
+                ? int.MinValue / 4
+                : (ctx.cellLevel[from] + fromInfo.enchant) * ctx.mysticFactor[from];
+            int best = -1;
+            int bestLevel = currentLevel;
+            for (int cell = 0; cell < ctx.storage; cell++)
+            {
+                if (cell == from || !IsAllowedLockedRow(fromInfo, cell / ctx.width) || ctx.disabled[cell])
+                {
+                    continue;
+                }
+
+                Slot target = slots[cell];
+                if (target != null && target.hasItem && target.tablet != null)
+                {
+                    continue; // 不用定向移动打乱石板；普通退火仍可评估这种变化。
+                }
+                if (target != null && target.hasItem &&
+                    ctx.itemByInstance.TryGetValue(target.instanceID, out ItemInfo targetInfo) && targetInfo != null)
+                {
+                    if (targetInfo.manualPriorityRank > 0 &&
+                        targetInfo.manualPriorityRank <= fromInfo.manualPriorityRank)
+                    {
+                        continue; // 不能为了较低排名的神器挤走更高排名神器。
+                    }
+                    if (!IsAllowedLockedRow(targetInfo, from / ctx.width))
+                    {
+                        continue;
+                    }
+                }
+
+                int level = (ctx.cellLevel[cell] + fromInfo.enchant) * ctx.mysticFactor[cell];
+                if (level > bestLevel)
+                {
+                    bestLevel = level;
+                    best = cell;
+                }
+            }
+            if (best < 0)
+            {
+                return false;
+            }
+            SwapSlots(slots, from, best);
+            return true;
+        }
+
+        private bool TryCriteriaMove(SearchContext ctx, List<Slot> slots, System.Random rng)
+        {
+            List<int> candidates = ctx.moveScratchA;
+            candidates.Clear();
+            for (int i = 0; i < slots.Count; i++)
+            {
+                if (slots[i].hasItem &&
+                    ctx.itemByInstance.TryGetValue(slots[i].instanceID, out ItemInfo item) &&
+                    item != null && item.isCharm && KindPriority(item.kind) >= 2)
                 {
                     candidates.Add(i);
                 }
@@ -4485,11 +4585,12 @@ namespace SephiriaBackpackOrganizer
             }
 
             int from = candidates[rng.Next(candidates.Count)];
-            CharmPositionKind kind = GetPositionKind(slots[from].charm);
             bool preferIgnore = ctx.itemByInstance.TryGetValue(slots[from].instanceID, out ItemInfo fromInfo) &&
                                 fromInfo != null && fromInfo.preferIgnoreCells;
+            CharmPositionKind kind = fromInfo != null ? fromInfo.kind : CharmPositionKind.None;
 
-            var targets = new List<int>();
+            List<int> targets = ctx.moveScratchB;
+            targets.Clear();
             for (int cell = 0; cell < ctx.storage; cell++)
             {
                 if (cell == from)
@@ -4499,10 +4600,12 @@ namespace SephiriaBackpackOrganizer
                 int x = cell % ctx.width;
                 int y = cell / ctx.width;
                 bool isIgnore = ctx.ignore[cell];
-                bool natural = IsSatisfyingCell(ctx.inv, kind, x, y, cell, ctx.storage, ctx.width);
+                bool natural = IsSatisfyingCell(kind, x, y, cell, ctx.storage, ctx.width);
                 bool sat = isIgnore || natural;
-                if (sat && !(slots[cell].hasItem && slots[cell].charm != null &&
-                             KindPriority(GetPositionKind(slots[cell].charm)) >= 2))
+                bool occupiedByRestricted = slots[cell].hasItem &&
+                    ctx.itemByInstance.TryGetValue(slots[cell].instanceID, out ItemInfo targetInfo) &&
+                    targetInfo != null && targetInfo.isCharm && KindPriority(targetInfo.kind) >= 2;
+                if (sat && !occupiedByRestricted)
                 {
                     // 冰锁类：只去豁免格（有豁免格目标时）；普通受限：只去自然满足格
                     if (preferIgnore && !isIgnore)
@@ -4527,9 +4630,11 @@ namespace SephiriaBackpackOrganizer
                     }
                     int x = cell % ctx.width;
                     int y = cell / ctx.width;
-                    if (IsSatisfyingCell(ctx.inv, kind, x, y, cell, ctx.storage, ctx.width) &&
-                        !(slots[cell].hasItem && slots[cell].charm != null &&
-                          KindPriority(GetPositionKind(slots[cell].charm)) >= 2))
+                    bool occupiedByRestricted = slots[cell].hasItem &&
+                        ctx.itemByInstance.TryGetValue(slots[cell].instanceID, out ItemInfo targetInfo) &&
+                        targetInfo != null && targetInfo.isCharm && KindPriority(targetInfo.kind) >= 2;
+                    if (IsSatisfyingCell(kind, x, y, cell, ctx.storage, ctx.width) &&
+                        !occupiedByRestricted)
                     {
                         targets.Add(cell);
                     }
@@ -4548,11 +4653,14 @@ namespace SephiriaBackpackOrganizer
         {
             // 找一个望远镜
             int moduleIdx = -1;
-            foreach (ItemInfo it in ctx.charms)
+            for (int cell = 0; cell < ctx.storage; cell++)
             {
-                if (it.isPlanetModule && slots[it.index] != null && slots[it.index].hasItem)
+                Slot slot = slots[cell];
+                if (slot != null && slot.hasItem &&
+                    ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo item) &&
+                    item != null && item.isPlanetModule)
                 {
-                    moduleIdx = it.index;
+                    moduleIdx = cell;
                     break;
                 }
             }
@@ -4564,18 +4672,21 @@ namespace SephiriaBackpackOrganizer
             // 找一个不在望远镜身边的 PLANET 藏品
             int mx = moduleIdx % ctx.width;
             int my = moduleIdx / ctx.width;
-            var planets = new List<int>();
-            foreach (ItemInfo it in ctx.items)
+            List<int> planets = ctx.moveScratchA;
+            planets.Clear();
+            for (int cell = 0; cell < ctx.storage; cell++)
             {
-                if (it.isPlanetCategory && !it.excludeFromPlanetCluster &&
-                    it.index != moduleIdx && slots[it.index] != null && slots[it.index].hasItem)
+                Slot slot = slots[cell];
+                if (cell != moduleIdx && slot != null && slot.hasItem &&
+                    ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo item) && item != null &&
+                    item.isPlanetCategory && !item.excludeFromPlanetCluster)
                 {
-                    int px = it.index % ctx.width;
-                    int py = it.index / ctx.width;
+                    int px = cell % ctx.width;
+                    int py = cell / ctx.width;
                     bool adjacent = Math.Abs(px - mx) <= 1 && Math.Abs(py - my) <= 1;
                     if (!adjacent)
                     {
-                        planets.Add(it.index);
+                        planets.Add(cell);
                     }
                 }
             }
@@ -4585,7 +4696,8 @@ namespace SephiriaBackpackOrganizer
             }
 
             // 找一个望远镜身边的空格（或可交换格）
-            var targets = new List<int>();
+            List<int> targets = ctx.moveScratchB;
+            targets.Clear();
             for (int i = 0; i < 8; i++)
             {
                 int nx = mx + Neighbor8[i].x;
@@ -4622,8 +4734,14 @@ namespace SephiriaBackpackOrganizer
                 FillItemPositionMap(slots, positions);
                 if (positions.TryGetValue(chain.instanceIDs[0], out int rootCell))
                 {
-                    var chainMembers = new HashSet<int>(chain.instanceIDs);
-                    var roots = new List<int>();
+                    HashSet<int> chainMembers = ctx.instanceSetScratch;
+                    chainMembers.Clear();
+                    for (int i = 0; i < chain.instanceIDs.Count; i++)
+                    {
+                        chainMembers.Add(chain.instanceIDs[i]);
+                    }
+                    List<int> roots = ctx.moveScratchA;
+                    roots.Clear();
                     for (int cell = 0; cell < ctx.storage; cell++)
                     {
                         if (cell == rootCell || !CanPlaceCompassChain(ctx, chain, cell, null))
@@ -4646,7 +4764,8 @@ namespace SephiriaBackpackOrganizer
                 }
             }
 
-            var compasses = new List<int>();
+            List<int> compasses = ctx.moveScratchA;
+            compasses.Clear();
             for (int cell = 0; cell < ctx.storage; cell++)
             {
                 Slot slot = slots[cell];
@@ -4661,11 +4780,18 @@ namespace SephiriaBackpackOrganizer
             {
                 return false;
             }
-            var unboundCompassCells = new HashSet<int>(compasses);
+            HashSet<int> unboundCompassCells = ctx.instanceSetScratch;
+            unboundCompassCells.Clear();
+            for (int i = 0; i < compasses.Count; i++)
+            {
+                unboundCompassCells.Add(compasses[i]);
+            }
 
             // 目标：把某块指北针移到"上方有有效依赖"的格子（空格或可交换格），或把攻击类藏品移到指北针上方
-            var compassTargets = new List<int>();
-            var damageTargets = new List<int>();
+            List<int> compassTargets = ctx.moveScratchB;
+            List<int> damageTargets = ctx.moveScratchC;
+            compassTargets.Clear();
+            damageTargets.Clear();
             for (int cell = 0; cell < ctx.storage; cell++)
             {
                 int x = cell % ctx.width;
@@ -4673,8 +4799,8 @@ namespace SephiriaBackpackOrganizer
                 int above = (y - 1) * ctx.width + x;
                 if (y > 0 && above >= 0 && above < ctx.storage && slots[above] != null && slots[above].hasItem && slots[above].charm != null)
                 {
-                    bool valid = slots[above].charm is Charm_UpCharmDamage ||
-                                 (slots[above].charm is IAttackableCharm ac && ac.IsAttackableCharm());
+                    bool valid = ctx.itemByInstance.TryGetValue(slots[above].instanceID, out ItemInfo aboveInfo) &&
+                                 aboveInfo != null && (aboveInfo.isCompass || aboveInfo.isAttackable);
                     if (valid)
                     {
                         // 目标格：空格，或任意非指北针物品（允许交换腾位；评分会拒绝不划算的交换）
@@ -4704,7 +4830,8 @@ namespace SephiriaBackpackOrganizer
 
             if (damageTargets.Count > 0)
             {
-                var damages = new List<int>();
+                List<int> damages = ctx.moveScratchD;
+                damages.Clear();
                 for (int cell = 0; cell < ctx.storage; cell++)
                 {
                     Slot slot = slots[cell];
@@ -4789,7 +4916,8 @@ namespace SephiriaBackpackOrganizer
             }
 
             RefreshWhitePaperAssignments(ctx, slots);
-            var paperCells = new List<int>();
+            List<int> paperCells = ctx.moveScratchA;
+            paperCells.Clear();
             for (int cell = 0; cell < ctx.storage; cell++)
             {
                 Slot slot = slots[cell];
@@ -4821,7 +4949,8 @@ namespace SephiriaBackpackOrganizer
                         continue;
                     }
 
-                    var artifacts = new List<int>();
+                    List<int> artifacts = ctx.moveScratchB;
+                    artifacts.Clear();
                     for (int cell = 0; cell < ctx.storage; cell++)
                     {
                         Slot slot = slots[cell];
@@ -4905,21 +5034,25 @@ namespace SephiriaBackpackOrganizer
         /// <summary>沙漏配对：把发光的沙漏移到 CD 最长的魔法书左边（或把 CD 长的魔法书移到沙漏右边）。</summary>
         private bool TryHourglassMove(SearchContext ctx, List<Slot> slots, System.Random rng)
         {
-            var hourglassIdx = new List<int>();
-            var magicIdx = new List<int>();
-            foreach (ItemInfo it in ctx.items)
+            List<int> hourglassIdx = ctx.moveScratchA;
+            List<int> magicIdx = ctx.moveScratchB;
+            hourglassIdx.Clear();
+            magicIdx.Clear();
+            for (int cell = 0; cell < ctx.storage; cell++)
             {
-                if (!(slots[it.index] != null && slots[it.index].hasItem))
+                Slot slot = slots[cell];
+                if (slot == null || !slot.hasItem ||
+                    !ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo item) || item == null)
                 {
                     continue;
                 }
-                if (it.isHourglass)
+                if (item.isHourglass)
                 {
-                    hourglassIdx.Add(it.index);
+                    hourglassIdx.Add(cell);
                 }
-                else if (it.isMagicBook)
+                else if (item.isMagicBook)
                 {
-                    magicIdx.Add(it.index);
+                    magicIdx.Add(cell);
                 }
             }
             if (hourglassIdx.Count == 0 || magicIdx.Count == 0)
@@ -4978,21 +5111,25 @@ namespace SephiriaBackpackOrganizer
         /// <summary>雷伊星碎片配对：把碎片移到耗蓝最高的魔法书右侧（或把耗蓝高的魔法书移到碎片左侧）。</summary>
         private bool TryRayShardMove(SearchContext ctx, List<Slot> slots, System.Random rng)
         {
-            var shardIdx = new List<int>();
-            var magicIdx = new List<int>();
-            foreach (ItemInfo it in ctx.items)
+            List<int> shardIdx = ctx.moveScratchA;
+            List<int> magicIdx = ctx.moveScratchB;
+            shardIdx.Clear();
+            magicIdx.Clear();
+            for (int cell = 0; cell < ctx.storage; cell++)
             {
-                if (!(slots[it.index] != null && slots[it.index].hasItem))
+                Slot slot = slots[cell];
+                if (slot == null || !slot.hasItem ||
+                    !ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo item) || item == null)
                 {
                     continue;
                 }
-                if (it.isRayShard)
+                if (item.isRayShard)
                 {
-                    shardIdx.Add(it.index);
+                    shardIdx.Add(cell);
                 }
-                else if (it.isMagicBook)
+                else if (item.isMagicBook)
                 {
-                    magicIdx.Add(it.index);
+                    magicIdx.Add(cell);
                 }
             }
             if (shardIdx.Count == 0 || magicIdx.Count == 0)
@@ -5067,12 +5204,16 @@ namespace SephiriaBackpackOrganizer
                 return false;
             }
 
-            var burdenIdx = new List<int>();
-            foreach (ItemInfo it in ctx.burdens)
+            List<int> burdenIdx = ctx.moveScratchA;
+            burdenIdx.Clear();
+            for (int cell = 0; cell < ctx.storage; cell++)
             {
-                if (slots[it.index] != null && slots[it.index].hasItem)
+                Slot slot = slots[cell];
+                if (slot != null && slot.hasItem &&
+                    ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo item) &&
+                    item != null && item.isBurden)
                 {
-                    burdenIdx.Add(it.index);
+                    burdenIdx.Add(cell);
                 }
             }
             if (burdenIdx.Count == 0)
@@ -5094,6 +5235,116 @@ namespace SephiriaBackpackOrganizer
             Slot tmp = slots[a];
             slots[a] = slots[b];
             slots[b] = tmp;
+        }
+
+        /// <summary>
+        /// 后台搜索专用乱序。所有石板属性均从主线程构建好的 ItemInfo 快照读取，
+        /// 不调用 DungeonManager 或任何 Unity/游戏对象方法。
+        /// </summary>
+        private static void ScrambleForSearch(SearchContext ctx, List<Slot> slots, System.Random rng)
+        {
+            var occupied = new List<int>();
+            for (int i = 0; i < slots.Count; i++)
+            {
+                if (slots[i].hasItem)
+                {
+                    occupied.Add(i);
+                }
+            }
+
+            for (int i = occupied.Count - 1; i > 0; i--)
+            {
+                int j = rng.Next(i + 1);
+                if (occupied[i] != occupied[j])
+                {
+                    SwapSlots(slots, occupied[i], occupied[j]);
+                }
+            }
+
+            foreach (int idx in occupied)
+            {
+                Slot slot = slots[idx];
+                if (slot.tablet != null && rng.Next(2) == 0 &&
+                    ctx.itemByInstance.TryGetValue(slot.instanceID, out ItemInfo info) &&
+                    info != null && info.tabletRotatable)
+                {
+                    slot.rotation = rng.Next(4);
+                }
+            }
+        }
+
+        private static long CreateSearchDeadline(int budgetMs)
+        {
+            if (budgetMs <= 0)
+            {
+                return 0;
+            }
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long budgetTicks = (long)(budgetMs * (double)System.Diagnostics.Stopwatch.Frequency / 1000d);
+            return now + Math.Max(1L, budgetTicks);
+        }
+
+        private static bool SearchDeadlineReached(long deadlineTicks)
+        {
+            return deadlineTicks > 0 && System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTicks;
+        }
+
+        /// <summary>
+        /// 将布局复制进已经分配好的缓冲区。搜索热循环只覆写字段，不再创建 Slot/List/数组，
+        /// 从而避免数百万个短命对象触发 Mono GC。
+        /// </summary>
+        private static void CopySlots(List<Slot> src, List<Slot> dst)
+        {
+            if (src == null || dst == null || src.Count != dst.Count)
+            {
+                throw new ArgumentException("布局缓冲区大小不一致");
+            }
+            for (int i = 0; i < src.Count; i++)
+            {
+                Slot from = src[i];
+                Slot to = dst[i];
+                to.hasItem = from.hasItem;
+                to.instanceID = from.instanceID;
+                to.entityID = from.entityID;
+                to.quantity = from.quantity;
+                to.charm = from.charm;
+                to.tablet = from.tablet;
+                to.rotation = from.rotation;
+            }
+        }
+
+        private static bool LayoutsEquivalent(List<Slot> a, List<Slot> b)
+        {
+            if (a == null || b == null || a.Count != b.Count)
+            {
+                return false;
+            }
+            for (int i = 0; i < a.Count; i++)
+            {
+                Slot left = a[i];
+                Slot right = b[i];
+                if (left == null || right == null || left.hasItem != right.hasItem)
+                {
+                    return false;
+                }
+                if (!left.hasItem)
+                {
+                    continue;
+                }
+                if (left.instanceID != right.instanceID)
+                {
+                    return false;
+                }
+                if (left.tablet != null || right.tablet != null)
+                {
+                    if (left.tablet == null || right.tablet == null ||
+                        ((left.rotation - right.rotation) & 3) != 0)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
 
         private static List<Slot> CloneSlots(List<Slot> src)
