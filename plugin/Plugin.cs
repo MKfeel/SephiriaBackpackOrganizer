@@ -2,6 +2,7 @@ using System;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using HarmonyLib;
 #if !BEPINEX5
 using BepInEx.Unity.Mono;
 using BepInEx.Unity.Mono.Configuration;
@@ -44,6 +45,17 @@ namespace SephiriaBackpackOrganizer
         internal ConfigEntry<int> EnhancedRestarts;
         internal ConfigEntry<float> EnhancedTemperature;
         internal ConfigEntry<int> SearchRounds;
+        internal ConfigEntry<int> SearchTimeBudgetMs;
+        internal ConfigEntry<bool> VerboseDiagnostics;
+
+        internal ConfigEntry<int> ApplySwapsPerFrame;
+        internal ConfigEntry<int> ApplyRotationClicksPerFrame;
+        internal ConfigEntry<float> ApplyFrameBudgetMs;
+        internal ConfigEntry<int> ApplyAckTimeoutMs;
+
+        internal ConfigEntry<bool> ManualPriorityEnabled;
+        internal ConfigEntry<bool> ShowManualPriorityBadge;
+        internal ConfigEntry<float> ManualPriorityStrength;
 
         internal ConfigEntry<bool> EnableSmartStart;
         internal ConfigEntry<bool> EnableRandomStarts;
@@ -95,6 +107,7 @@ namespace SephiriaBackpackOrganizer
         internal ConfigEntry<float> MysticMultiplier;
 
         private InventorySorter sorter;
+        private Harmony harmony;
         private bool autoSortedThisSession;
         private bool lastSessionActive;
 
@@ -108,9 +121,10 @@ namespace SephiriaBackpackOrganizer
                 "触发背包整理的快捷键（游戏使用新输入系统，插件会同时兼容新旧输入）");
 
             Mode = Config.Bind("General", "SortMode", SortMode.Enhanced,
-                "整理模式：\n" +
-                "Vanilla = 调用游戏内置的自动排列（任意模式可用，含联机作为客户端时）；\n" +
-                "Enhanced = 增强版模拟退火优化（更彻底，仅主机/单机可用，非主机时自动回退到 Vanilla）。");
+                new ConfigDescription(
+                    "整理模式：\n" +
+                    "Vanilla = 调用游戏内置的自动排列（任意模式可用，含联机作为客户端时）；\n" +
+                    "Enhanced = 后台增强搜索，并通过分帧交换/旋转安全应用；主机与联机客户端均可用。"));
 
             ShowNotifications = Config.Bind("General", "ShowNotifications", true,
                 "是否在游戏内显示整理结果提示（屏幕系统消息）");
@@ -148,12 +162,48 @@ namespace SephiriaBackpackOrganizer
 
             SearchRounds = Config.Bind("Enhanced", "SearchRounds", 4,
                 new ConfigDescription("每次整理的独立搜索轮数（每轮不同随机种子，取全局最优）。" +
-                    "相当于自动重复按 F8 多次；默认 4 轮，34格满包约 200~300ms",
+                    "相当于自动重复按 F8 多次；搜索时间达到预算后会提前结束",
                     new AcceptableValueRange<int>(1, 10)));
 
+            SearchTimeBudgetMs = Config.Bind("Enhanced", "SearchTimeBudgetMs", 0,
+                new ConfigDescription("增强搜索的主线程时间预算（毫秒）。达到预算后保留当前最优布局并提前结束；" +
+                    "0=不限制并完整执行所有搜索（默认，质量优先）。需要进一步限制停顿时建议 100~250；" +
+                    "数值过低会跳过随机起点与后续重启，明显降低整理质量",
+                    new AcceptableValueRange<int>(0, 1000)));
+
+            ApplySwapsPerFrame = Config.Bind("Apply", "SwapsPerFrame", 2,
+                new ConfigDescription("每帧最多执行的背包交换次数。数值越低越平滑，默认 2",
+                    new AcceptableValueRange<int>(1, 10)));
+
+            ApplyRotationClicksPerFrame = Config.Bind("Apply", "RotationClicksPerFrame", 4,
+                new ConfigDescription("每帧最多执行的石板旋转点击次数。默认 4",
+                    new AcceptableValueRange<int>(1, 12)));
+
+            ApplyFrameBudgetMs = Config.Bind("Apply", "FrameBudgetMs", 2f,
+                new ConfigDescription("每帧应用整理操作的时间预算（毫秒），默认 2",
+                    new AcceptableValueRange<float>(0.25f, 10f)));
+
+            ApplyAckTimeoutMs = Config.Bind("Apply", "NetworkAckTimeoutMs", 2000,
+                new ConfigDescription("联机时等待服务器确认每批操作的最长毫秒数，默认 2000",
+                    new AcceptableValueRange<int>(250, 10000)));
+
+            ManualPriorityEnabled = Config.Bind("ManualPriority", "Enabled", true,
+                "允许用鼠标中键点击背包中的神器来切换手动提权");
+
+            ShowManualPriorityBadge = Config.Bind("ManualPriority", "ShowBadge", true,
+                "在已提权神器左下角显示透明小字 P1、P2…；P1 是最后提权、权重最高的神器");
+
+            ManualPriorityStrength = Config.Bind("ManualPriority", "Strength", 50f,
+                new ConfigDescription("手动提权对神器等级评分的额外强度。P1 完整获得，P2 按 1/4、P3 按 1/9 衰减",
+                    new AcceptableValueRange<float>(1f, 500f)));
+
+            VerboseDiagnostics = Config.Bind("Debug", "VerboseDiagnostics", false,
+                "输出完整物品识别、布局网格和特殊机制分析。关闭可减少每次整理后的额外评分与日志开销");
+
             EnableSmartStart = Config.Bind("Smart", "EnableSmartStart", true,
-                "启用智能初始布局：石板贪心摆位（正覆盖最大化、负等级推出背包外或压到非护符下）、" +
-                "受限护符优先放满足位置条件的格子或豁免格（解除限制的石板格）");
+                new ConfigDescription(
+                    "启用智能初始布局：石板贪心摆位（正覆盖最大化、负等级推出背包外或压到非护符下）、" +
+                    "受限护符优先放满足位置条件的格子或豁免格（解除限制的石板格）"));
 
             EnableRandomStarts = Config.Bind("Smart", "EnableRandomStarts", true,
                 "多起点搜索：退火从 智能初始/原始/随机 多个起点跑，取全局最优（离线评估极快，开销可忽略）");
@@ -171,8 +221,9 @@ namespace SephiriaBackpackOrganizer
                     new AcceptableValueRange<float>(0f, 1f)));
 
             PriorityEnable = Config.Bind("Priority", "Enable", true,
-                "藏品优先级系统：1级(最高)→4级(最低)。默认：传说=1、羁绊(永恒)=1、稀有=2、高级=3、普通=4。" +
-                "高优先级藏品优先满足等级与位置需求，必要时低级藏品被牺牲进负格");
+                new ConfigDescription(
+                    "藏品优先级系统：1级(最高)→4级(最低)。默认：传说=1、羁绊(永恒)=1、稀有=2、高级=3、普通=4。" +
+                    "高优先级藏品优先满足等级与位置需求，必要时低级藏品被牺牲进负格"));
 
             PriorityCommon = Config.Bind("Priority", "Common", 4,
                 new ConfigDescription("普通(Common)优先级（1最高~4最低）", new AcceptableValueRange<int>(1, 4)));
@@ -334,6 +385,8 @@ namespace SephiriaBackpackOrganizer
                 "自检模式（仅主机可用）：按热键时先把背包随机打乱再整理，对比前后评分，用于验证优化器是否有效");
 
             sorter = new InventorySorter(this);
+            harmony = new Harmony(PluginInfo.PLUGIN_GUID);
+            harmony.PatchAll(typeof(Plugin).Assembly);
             Log.LogInfo($"{PluginInfo.PLUGIN_NAME} v{PluginInfo.PLUGIN_VERSION} 已加载。" +
                         $"按 [{Hotkey.Value}] 整理背包（当前模式: {Mode.Value}）");
         }
@@ -341,12 +394,14 @@ namespace SephiriaBackpackOrganizer
         /// <summary>每帧轮询逻辑（热键检测/会话诊断/自动整理）。两个 BepInEx 版本均由 MonoBehaviour Update 消息调用。</summary>
         private void Tick()
         {
-            // 驱动异步整理任务（退火计算/应用 Swap 分帧推进）
-            if (sorter != null)
+            if (sorter == null)
             {
-                sorter.AdvancePendingSort();
+                return;
             }
-            if (sorter == null || sorter.Busy)
+
+            // 后台搜索完成后，只在 Unity 主线程执行背包交换与结果校验。
+            sorter.Poll();
+            if (sorter.Busy)
             {
                 return;
             }
@@ -359,6 +414,7 @@ namespace SephiriaBackpackOrganizer
                 if (!sessionActive)
                 {
                     sorter.ResetSessionClock(); // 退出会话：重置背包初始化计时
+                    ManualPriorityManager.Clear();
                 }
                 Log.LogInfo($"会话状态变化: NetworkClient.active={NetworkClient.active}, " +
                             $"localPlayer={(NetworkClient.localPlayer != null ? "有" : "无")}");
@@ -468,14 +524,19 @@ namespace SephiriaBackpackOrganizer
 
         private void OnDestroy()
         {
+            harmony?.UnpatchSelf();
+            harmony = null;
+            ManualPriorityManager.Clear();
             Instance = null;
         }
+
+        internal bool IsSorting => sorter != null && sorter.Busy;
     }
 
     internal static class PluginInfo
     {
         public const string PLUGIN_GUID = "com.sephiria.backpack-organizer";
         public const string PLUGIN_NAME = "Sephiria Backpack Organizer";
-        public const string PLUGIN_VERSION = "2.4.9";
+        public const string PLUGIN_VERSION = "2.5.0";
     }
 }

@@ -1,6 +1,8 @@
 # 编译产物
 bin/
 obj/
+bin5/
+obj5/
 *.dll
 *.pdb
 
