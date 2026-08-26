@@ -341,6 +341,11 @@ namespace SephiriaBackpackOrganizer
         /// <summary>每帧轮询逻辑（热键检测/会话诊断/自动整理）。两个 BepInEx 版本均由 MonoBehaviour Update 消息调用。</summary>
         private void Tick()
         {
+            // 驱动异步整理任务（退火计算/应用 Swap 分帧推进）
+            if (sorter != null)
+            {
+                sorter.AdvancePendingSort();
+            }
             if (sorter == null || sorter.Busy)
             {
                 return;
@@ -471,6 +476,6 @@ namespace SephiriaBackpackOrganizer
     {
         public const string PLUGIN_GUID = "com.sephiria.backpack-organizer";
         public const string PLUGIN_NAME = "Sephiria Backpack Organizer";
-        public const string PLUGIN_VERSION = "2.4.8";
+        public const string PLUGIN_VERSION = "2.4.9";
     }
 }

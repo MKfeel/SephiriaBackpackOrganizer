@@ -48,6 +48,7 @@ namespace SephiriaBackpackOrganizer
         private readonly Plugin plugin;
         private bool busy;
         private float sessionStartTime = -1f;
+        private SortJobState pendingSort;   // 异步整理任务（计算/应用分帧）
 
         public bool Busy => busy;
 
@@ -89,6 +90,44 @@ namespace SephiriaBackpackOrganizer
             }
 
             public static Slot Empty() => new Slot();
+        }
+
+        /// <summary>步进式退火状态（每帧执行预算内的迭代，避免主线程长阻塞）。</summary>
+        private sealed class AnnealState
+        {
+            public List<Slot> best;
+            public double bestScore;
+            public List<Slot> candidate;
+            public double candidateScore;
+            public int restart;
+            public int iter;
+            public System.Random rng;
+            public int iterations;
+            public int restarts;
+            public float temp0;
+        }
+
+        /// <summary>异步整理任务状态机：计算分帧（多轮×多起点退火）+ 应用分帧（每帧少量 Swap）。</summary>
+        private sealed class SortJobState
+        {
+            public GridInventory inv;
+            public List<Slot> original;
+            public List<Slot> smartStart;
+            public SearchContext ctx;
+            public double beforeScore;
+            public double globalBest;
+            public List<Slot> bestLayout;
+            public int round;
+            public int startIdx;
+            public List<List<Slot>> starts;   // 当前轮起点
+            public AnnealState anneal;         // 当前起点退火（null = 取下一个）
+            public List<(int a, int b)> swaps;
+            public List<(int pos, int count)> rots;
+            public int applyIdx;               // 交换指针（先全部交换，再旋转）
+            public int rotIdx;
+            public bool computingDone;
+            public bool isClient;              // 联机客户端模式
+            public System.Diagnostics.Stopwatch clock = new System.Diagnostics.Stopwatch();
         }
 
         // ---------------------------------------------------------------- 护符位置条件
@@ -2611,8 +2650,11 @@ namespace SephiriaBackpackOrganizer
             bool[] occupied = new bool[storage];
 
             // 1) 石板：有负效果的优先摆，逐格逐旋转打分（含条件检查）
+            //    steleEffectCells：已放石板的加成格集合——贪心避开"站到别人加成格上"，
+            //    把加成留给护符（治本：修复智能初始评分退化）
             var steles = new List<ItemInfo>(ctx.steles);
             steles.Sort((a, b) => SteleImportance(b.slot).CompareTo(SteleImportance(a.slot)));
+            var steleEffectCells = new HashSet<int>();
             foreach (ItemInfo stele in steles)
             {
                 int bestIdx = -1;
@@ -2631,7 +2673,7 @@ namespace SephiriaBackpackOrganizer
                         if (ctx.stelePatterns.TryGetValue(stele.index, out var byCell) &&
                             byCell.TryGetValue(cell * 4 + rot, out var pattern))
                         {
-                            float sc = EvaluateStelePattern(ctx, pattern, result, occupied);
+                            float sc = EvaluateStelePattern(ctx, pattern, result, occupied, steleEffectCells);
                             if (sc > bestScore)
                             {
                                 bestScore = sc;
@@ -2647,6 +2689,18 @@ namespace SephiriaBackpackOrganizer
                     stele.slot.rotation = bestRot;
                     result[bestIdx] = stele.slot;
                     occupied[bestIdx] = true;
+                    // 记录该石板的效果格（供后续石板避开）
+                    if (ctx.stelePatterns.TryGetValue(stele.index, out var byCell2) &&
+                        byCell2.TryGetValue(bestIdx * 4 + bestRot, out var placedPattern))
+                    {
+                        foreach (EffectEntry e in placedPattern.effects)
+                        {
+                            if (e.cell >= 0 && e.cell < storage)
+                            {
+                                steleEffectCells.Add(e.cell);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3060,7 +3114,8 @@ namespace SephiriaBackpackOrganizer
             }
         }
 
-        private static float EvaluateStelePattern(SearchContext ctx, StelePattern pattern, Slot[] result, bool[] occupied)
+        private static float EvaluateStelePattern(SearchContext ctx, StelePattern pattern, Slot[] result, bool[] occupied,
+            HashSet<int> steleEffectCells = null)
         {
             if (!ConditionsOk(pattern, SlotsFromArray(result, ctx.storage)))
             {
@@ -3068,6 +3123,11 @@ namespace SephiriaBackpackOrganizer
             }
 
             float score = 0f;
+            // 石板自身格若落在已有加成格上：该加成被石板吃掉、护符用不上 → 重罚，贪心会避开
+            if (steleEffectCells != null && pattern.cell >= 0 && steleEffectCells.Contains(pattern.cell))
+            {
+                score -= 100f;
+            }
             foreach (EffectEntry e in pattern.effects)
             {
                 bool covered = e.cell >= 0 && e.cell < ctx.storage && (occupied[e.cell] || result[e.cell] != null);
@@ -3077,7 +3137,11 @@ namespace SephiriaBackpackOrganizer
                         score += e.value * 10f;
                         if (e.value < 0 && !covered)
                         {
-                            score -= 160f;
+                            score -= 160f; // 负效果落在空格：重罚
+                        }
+                        else if (e.value > 0 && covered)
+                        {
+                            score -= 60f; // 正值效果落在已占用格：加成浪费
                         }
                         break;
                     case 2:
@@ -3628,15 +3692,9 @@ namespace SephiriaBackpackOrganizer
                         break;
 
                     case SortMode.Enhanced:
-                        if (NetworkServer.active)
-                        {
-                            SortEnhanced(inv);
-                        }
-                        else
-                        {
-                            // 联机客户端：本地离线算最优布局，用游戏自带网络接口(Swap/DoClickAction)执行
-                            SortClient(inv);
-                        }
+                        // 异步整理：计算（多帧退火）+ 应用（每帧少量 Swap）分帧执行，
+                        // 消除主线程长阻塞与一次性同步风暴（联机卡顿的关键优化）
+                        TryStartAsyncSort(inv);
                         break;
 
                     default:
@@ -3649,11 +3707,57 @@ namespace SephiriaBackpackOrganizer
             {
                 Plugin.Log.LogError($"整理背包异常: {ex}");
                 Notify("整理背包失败，详见日志。");
+                pendingSort = null;
             }
             finally
             {
-                busy = false;
+                // 异步任务进行中（pendingSort 非空）保持 busy=true，防止重复触发覆盖任务
+                if (pendingSort == null)
+                {
+                    busy = false;
+                }
             }
+        }
+
+        /// <summary>启动异步增强整理：同步准备快照/上下文/智能初始（几十 ms），
+        /// 退火计算与应用 Swap 由 AdvancePendingSort 每帧分片推进（消除主线程长阻塞与同步风暴）。</summary>
+        private void TryStartAsyncSort(GridInventory inv)
+        {
+            List<Slot> original = CaptureState(inv);
+            if (!VerifyInventorySnapshot(inv, original))
+            {
+                Notify("背包状态未就绪，本次未整理（请稍后再试）。");
+                busy = false;
+                return;
+            }
+            SearchContext ctx = BuildContext(inv, original);
+            LogItemIdentification(ctx);
+
+            var job = new SortJobState
+            {
+                inv = inv,
+                original = original,
+                ctx = ctx,
+                beforeScore = EvaluateLayout(ctx, original),
+                globalBest = EvaluateLayout(ctx, original),
+                bestLayout = original,
+                isClient = !NetworkServer.active,
+                computingDone = false
+            };
+            if (plugin.EnableSmartStart.Value)
+            {
+                job.smartStart = BuildSmartStart(ctx);
+                double smartScore = EvaluateLayout(ctx, job.smartStart);
+                Plugin.Log.LogInfo($"智能初始布局：评分 {job.beforeScore:F0} -> {smartScore:F0}");
+            }
+            else
+            {
+                job.smartStart = original;
+            }
+
+            pendingSort = job;
+            job.clock.Start();
+            Notify("整理中…");
         }
 
         // ---------------------------------------------------------------- Vanilla
@@ -3993,6 +4097,249 @@ namespace SephiriaBackpackOrganizer
             }
 
             return new AnnealResult { Best = best, Score = bestScore };
+        }
+
+        /// <summary>步进式退火：每次调用最多执行 budget 次迭代，返回是否完成（供分帧任务使用）。
+        /// 语义与 Anneal 完全一致：历史最优 best 只升不降，candidate 允许变差漂移，重启回到 best。</summary>
+        private bool AnnealAdvance(SearchContext ctx, AnnealState st, int budget)
+        {
+            int done = 0;
+            while (done < budget)
+            {
+                if (st.restart >= st.restarts)
+                {
+                    return true;
+                }
+                if (st.iter >= st.iterations)
+                {
+                    // 重启：回到当前最优
+                    st.candidate = CloneSlots(st.best);
+                    st.candidateScore = EvaluateLayout(ctx, st.best);
+                    st.restart++;
+                    st.iter = 0;
+                    if (st.restart >= st.restarts)
+                    {
+                        return true;
+                    }
+                }
+
+                var mutated = CloneSlots(st.candidate);
+                Mutate(ctx, mutated, st.rng);
+                if (!RestoreCompassBindings(ctx, mutated))
+                {
+                    st.iter++;
+                    done++;
+                    continue;
+                }
+                double s = EvaluateLayout(ctx, mutated);
+                if (s > st.bestScore)
+                {
+                    st.best = CloneSlots(mutated);
+                    st.bestScore = s;
+                }
+                double t = Math.Max(1f, st.temp0 * (1f - (double)st.iter / Math.Max(1, st.iterations)));
+                bool accept = s >= st.candidateScore ||
+                              st.rng.NextDouble() < Math.Exp((s - st.candidateScore) / t);
+                if (accept)
+                {
+                    st.candidate = mutated;
+                    st.candidateScore = s;
+                }
+                st.iter++;
+                done++;
+            }
+            return false;
+        }
+
+        /// <summary>构建多起点列表（智能初始 / 原始 / 随机×2），随机部分用传入 rng。</summary>
+        private List<List<Slot>> BuildStarts(SearchContext ctx, List<Slot> smartStart, List<Slot> original, System.Random rng)
+        {
+            var starts = new List<List<Slot>> { smartStart };
+            if (plugin.EnableRandomStarts.Value)
+            {
+                starts.Add(original);
+                var r1 = CloneSlots(original);
+                Scramble(r1, rng);
+                starts.Add(r1);
+                var r2 = CloneSlots(original);
+                Scramble(r2, rng);
+                starts.Add(r2);
+            }
+            return starts;
+        }
+
+        /// <summary>每帧驱动异步整理任务（由 Plugin.Tick 调用）：先分帧退火计算，再分帧执行 Swap/旋转。</summary>
+        public void AdvancePendingSort()
+        {
+            var j = pendingSort;
+            if (j == null)
+            {
+                return;
+            }
+            if (!NetworkClient.active)
+            {
+                CancelPendingSort("会话已退出，取消本次整理");
+                return;
+            }
+            if (!j.computingDone)
+            {
+                AdvanceCompute(j);
+            }
+            else
+            {
+                AdvanceApply(j);
+            }
+        }
+
+        private void AdvanceCompute(SortJobState j)
+        {
+            int rounds = Math.Max(1, plugin.SearchRounds.Value);
+            if (j.round >= rounds)
+            {
+                FinishCompute(j);
+                return;
+            }
+
+            if (j.anneal == null)
+            {
+                if (j.starts == null || j.startIdx >= j.starts.Count)
+                {
+                    // 本轮起点用完 → 进入下一轮（新随机种子重建起点列表）
+                    j.round++;
+                    if (j.round >= rounds)
+                    {
+                        FinishCompute(j);
+                        return;
+                    }
+                    var rng = new System.Random(Environment.TickCount + j.round * 7919);
+                    j.starts = BuildStarts(j.ctx, j.smartStart, j.original, rng);
+                    j.startIdx = 0;
+                }
+                var start = j.starts[j.startIdx++];
+                j.anneal = new AnnealState
+                {
+                    rng = new System.Random(Environment.TickCount + j.round * 7919 + j.startIdx * 131),
+                    iterations = plugin.EnhancedIterations.Value,
+                    restarts = plugin.EnhancedRestarts.Value,
+                    temp0 = plugin.EnhancedTemperature.Value
+                };
+                j.anneal.best = CloneSlots(start);
+                if (!RestoreCompassBindings(j.ctx, j.anneal.best))
+                {
+                    j.anneal.best = CloneSlots(j.ctx.original);
+                }
+                j.anneal.bestScore = EvaluateLayout(j.ctx, j.anneal.best);
+                j.anneal.candidate = CloneSlots(j.anneal.best);
+                j.anneal.candidateScore = j.anneal.bestScore;
+            }
+
+            bool finished = AnnealAdvance(j.ctx, j.anneal, ComputeIterationsPerFrame);
+            if (finished)
+            {
+                if (j.anneal.bestScore > j.globalBest)
+                {
+                    j.globalBest = j.anneal.bestScore;
+                    j.bestLayout = CloneSlots(j.anneal.best);
+                }
+                j.anneal = null;
+            }
+        }
+
+        /// <summary>每帧退火迭代预算（约 3ms，量级 1µs/迭代）。</summary>
+        private int ComputeIterationsPerFrame => 3000;
+
+        private void FinishCompute(SortJobState j)
+        {
+            j.computingDone = true;
+
+            if (!CompassBindingsSatisfied(j.ctx, j.bestLayout))
+            {
+                Plugin.Log.LogWarning("搜索结果破坏了整理前的指北针目标绑定，已回退整理前布局。");
+                j.bestLayout = CloneSlots(j.original);
+                j.globalBest = j.beforeScore;
+            }
+
+            List<Slot> final = j.globalBest >= j.beforeScore - 0.5 ? j.bestLayout : j.original;
+            j.swaps = new List<(int a, int b)>();
+            j.rots = new List<(int pos, int count)>();
+            BuildClientOps(j.inv, j.original, final, j.swaps, j.rots);
+            j.applyIdx = 0;
+            j.rotIdx = 0;
+
+            if (j.swaps.Count == 0 && j.rots.Count == 0)
+            {
+                FinishSort(j);
+                return;
+            }
+            // 交换/旋转数量只写日志（诊断用），玩家界面仅显示"整理中…"与"整理完毕"
+            Plugin.Log.LogInfo($"整理调整：{j.swaps.Count} 次交换 / {j.rots.Count} 处旋转");
+        }
+
+        private void AdvanceApply(SortJobState j)
+        {
+            // 交换：每帧最多 2 次（分摊同步风暴）
+            int swapBudget = 2;
+            while (swapBudget > 0 && j.applyIdx < j.swaps.Count)
+            {
+                var (a, b) = j.swaps[j.applyIdx++];
+                ItemPosition pa = j.inv.IdxToPos(a);
+                ItemPosition pb = j.inv.IdxToPos(b);
+                j.inv.Swap(pa.x, pa.y, pb.x, pb.y);
+                swapBudget--;
+            }
+            if (j.applyIdx < j.swaps.Count)
+            {
+                return; // 交换未完，等下一帧
+            }
+
+            // 旋转：每帧最多 4 次点击
+            int rotBudget = 4;
+            while (rotBudget > 0 && j.rotIdx < j.rots.Count)
+            {
+                var (pos, count) = j.rots[j.rotIdx];
+                ItemPosition p = j.inv.IdxToPos(pos);
+                for (int r = 0; r < count && rotBudget > 0; r++)
+                {
+                    j.inv.DoClickAction(p);
+                    rotBudget--;
+                }
+                j.rotIdx++;
+            }
+            if (j.rotIdx < j.rots.Count)
+            {
+                return;
+            }
+
+            FinishSort(j);
+        }
+
+        private void FinishSort(SortJobState j)
+        {
+            j.clock.Stop();
+            float finalGameScore = SafeScore(j.inv);
+            double finalOffline = EvaluateLayout(j.ctx, j.bestLayout);
+            float beforeGame = SafeScoreBefore(j.inv, j.original);
+
+            LogLayoutGrid(j.ctx, j.bestLayout, "整理");
+            LogLayoutAnalysis(j.ctx, j.bestLayout, "整理");
+
+            string modeTag = j.isClient ? "联机客户端整理完成" : "增强整理完成";
+            Plugin.Log.LogInfo(
+                $"{modeTag}（{j.clock.ElapsedMilliseconds}ms）：离线评分 {j.beforeScore:F0} -> {finalOffline:F0}" +
+                $"（搜索最优 {j.globalBest:F0}）；游戏评分 {beforeGame:F0} -> {finalGameScore:F0}" +
+                $"；布局 {j.ctx.items.Count} 件（石板{j.ctx.steles.Count} 护符{j.ctx.charms.Count}" +
+                $" 负担{j.ctx.burdens.Count} 其他{j.ctx.others.Count}）" +
+                (j.isClient ? $"; 交换 {j.swaps.Count} 次/旋转 {j.rots.Count} 处" : ""));
+            Notify("整理完毕");
+            busy = false;
+            pendingSort = null;
+        }
+
+        private void CancelPendingSort(string reason)
+        {
+            Plugin.Log.LogWarning(reason);
+            busy = false;
+            pendingSort = null;
         }
 
         /// <summary>多起点退火：智能初始 / 原始布局 / 随机布局各跑一轮，取全局最优（离线评估极快，开销可忽略）。</summary>
