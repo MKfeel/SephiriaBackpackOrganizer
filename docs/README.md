@@ -1,9 +1,11 @@
 # Sephiria Backpack Organizer / 赛菲莉娅 背包整理插件
 
+<p align="center"><font size="6"><b>🔥 F8整理，中键自定义优先级!!! 🔥</b></font></p>
+
 🌏 **语言 / Language**：[中文](README.md) · [English](README.en.md) · [한국어](README.ko.md)
 
 ![Downloads](https://img.shields.io/github/downloads/Infinite-Heaven/SephiriaBackpackOrganizer/total?label=Downloads&color=2f6fad)
-![往期下载量合计](https://img.shields.io/badge/%E5%BE%80%E6%9C%9F%E4%B8%8B%E8%BD%BD%E9%87%8F%E5%90%88%E8%AE%A1-1595-2f6fad)
+![往期下载量合计](https://img.shields.io/badge/%E5%BE%80%E6%9C%9F%E4%B8%8B%E8%BD%BD%E9%87%8F%E5%90%88%E8%AE%A1-1762-2f6fad)
 
 《赛菲莉娅》(Sephiria, Steam AppID 2436940) 的 BepInEx 插件。按 **F8** 一键整理背包，把石板覆盖、护符位置条件、行星聚簇、和谐之晶、奉献徽章、凯尔萨德尼钥匙周期行、指北针原目标绑定、白纸连击补位、发光的沙漏等所有加成机制尽可能同时吃到。
 
